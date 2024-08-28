@@ -162,7 +162,9 @@ TASKLOOP:
 	})
 	// If we enabled dynamic prune mode, then we need to generate global stats here for partition tables.
 	if needGlobalStats {
+		logutil.BgLogger().Info("debug: start handle global stats")
 		err = e.handleGlobalStats(statsHandle, globalStatsMap)
+		logutil.BgLogger().Info("debug: end handle global stats")
 		if err != nil {
 			return err
 		}
@@ -173,6 +175,7 @@ TASKLOOP:
 	if err != nil {
 		sessionVars.StmtCtx.AppendWarning(err)
 	}
+	logutil.BgLogger().Info("debug: start update stats")
 	return statsHandle.Update(ctx, infoSchema)
 }
 

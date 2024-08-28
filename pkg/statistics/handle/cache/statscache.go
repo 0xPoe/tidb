@@ -148,6 +148,8 @@ func (s *StatsCacheImpl) Update(ctx context.Context, is infoschema.InfoSchema) e
 			tbl.LastAnalyzeVersion = snapshot
 		}
 		tables = append(tables, tbl)
+
+		statslogutil.StatsLogger().Info("debug: tbl loaded", zap.Any("tbl", tbl), zap.Int64("tableID", tbl.PhysicalID), zap.Bool("Pseudo", tbl.Pseudo))
 	}
 
 	s.UpdateStatsCache(tables, deletedTableIDs)

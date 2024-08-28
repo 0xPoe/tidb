@@ -37,7 +37,9 @@ import (
 	"github.com/pingcap/tidb/pkg/statistics/handle/util"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/intest"
+	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
+	"go.uber.org/zap"
 )
 
 // statsReadWriter implements the util.StatsReadWriter interface.
@@ -252,6 +254,10 @@ func (s *statsReadWriter) SaveStatsToStorage(
 	updateAnalyzeTime bool,
 	source string,
 ) (err error) {
+	start := time.Now()
+	defer func() {
+		logutil.BgLogger().Info("SaveStatsToStorage", zap.Int64("tableID", tableID), zap.Duration("cost", time.Since(start)))
+	}()
 	var statsVer uint64
 	err = util.CallWithSCtx(s.statsHandler.SPool(), func(sctx sessionctx.Context) error {
 		statsVer, err = SaveStatsToStorage(sctx, tableID,

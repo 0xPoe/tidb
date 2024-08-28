@@ -168,6 +168,7 @@ func (sc *StatsCache) Update(tables []*statistics.Table, deletedIDs []int64) {
 		id := tbl.PhysicalID
 		metrics.UpdateCounter.Inc()
 		sc.c.Put(id, tbl)
+		logutil.BgLogger().Info("debug: update table stats", zap.Int64("tableID", id), zap.Any("table", tbl))
 	}
 	for _, id := range deletedIDs {
 		metrics.DelCounter.Inc()
