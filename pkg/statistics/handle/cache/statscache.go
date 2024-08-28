@@ -67,6 +67,7 @@ func NewStatsCacheImplForTest() (types.StatsCache, error) {
 func (s *StatsCacheImpl) Update(ctx context.Context, is infoschema.InfoSchema) error {
 	start := time.Now()
 	lastVersion := s.getLastVersion()
+	logutil.BgLogger().Debug("debug: lastVersion in update", zap.Uint64("lastVersion", lastVersion))
 	var (
 		rows []chunk.Row
 		err  error
@@ -168,7 +169,9 @@ func (s *StatsCacheImpl) getLastVersion() uint64 {
 	// We can read the stats if the diff between commit time and version is less than three lease.
 	offset := util.DurationToTS(3 * s.statsHandle.Lease())
 	if s.MaxTableStatsVersion() >= offset {
+		logutil.BgLogger().Debug("debug: lastVersion", zap.Uint64("lastVersion", lastVersion), zap.Uint64("offset", offset))
 		lastVersion = lastVersion - offset
+		logutil.BgLogger().Debug("debug: lastVersion after offset", zap.Uint64("lastVersion", lastVersion))
 	} else {
 		lastVersion = 0
 	}
