@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/parser/ast"
@@ -27,8 +26,10 @@ import (
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/statistics"
 	"github.com/pingcap/tidb/pkg/statistics/handle/cache"
+	statslogutil "github.com/pingcap/tidb/pkg/statistics/handle/logutil"
 	"github.com/pingcap/tidb/pkg/statistics/handle/types"
 	statsutil "github.com/pingcap/tidb/pkg/statistics/handle/util"
+	"go.uber.org/zap"
 )
 
 // UpdateStatsVersion will set statistics version to the newest TS, then
@@ -86,75 +87,120 @@ func UpdateStatsMeta(
 	}
 
 	// Separate locked and unlocked updates
-	// In most cases, the number of locked tables is small.
-	lockedTableIDs := make([]string, 0, 20)
-	lockedValues := make([]string, 0, 20)
-	// In most cases, the number of unlocked tables is large.
-	unlockedTableIDs := make([]string, 0, len(updates))
-	unlockedPosValues := make([]string, 0, max(len(updates)/2, 1))
-	unlockedNegValues := make([]string, 0, max(len(updates)/2, 1))
+	lockedUpdates := make([]*DeltaUpdate, 0, 20)
+	unlockedUpdates := make([]*DeltaUpdate, 0, len(updates))
 	cacheInvalidateIDs := make([]int64, 0, len(updates))
 
 	for _, update := range updates {
 		if update.IsLocked {
-			lockedTableIDs = append(lockedTableIDs, fmt.Sprintf("%d", update.TableID))
-			lockedValues = append(lockedValues, fmt.Sprintf("(%d, %d, %d, %d)",
-				startTS, update.TableID, update.Delta.Count, update.Delta.Delta))
+			lockedUpdates = append(lockedUpdates, update)
 		} else {
-			unlockedTableIDs = append(unlockedTableIDs, fmt.Sprintf("%d", update.TableID))
-			if update.Delta.Delta < 0 {
-				unlockedNegValues = append(unlockedNegValues, fmt.Sprintf("(%d, %d, %d, %d)",
-					startTS, update.TableID, update.Delta.Count, -update.Delta.Delta))
-			} else {
-				unlockedPosValues = append(unlockedPosValues, fmt.Sprintf("(%d, %d, %d, %d)",
-					startTS, update.TableID, update.Delta.Count, update.Delta.Delta))
-			}
+			unlockedUpdates = append(unlockedUpdates, update)
 			cacheInvalidateIDs = append(cacheInvalidateIDs, update.TableID)
 		}
 	}
 
-	// Lock the stats_meta and stats_table_locked tables using SELECT FOR UPDATE to prevent write conflicts.
-	// This ensures that we acquire the necessary locks before attempting to update the tables, reducing the likelihood
-	// of encountering lock conflicts during the update process.
-	lockedTableIDsStr := strings.Join(lockedTableIDs, ",")
-	if lockedTableIDsStr != "" {
-		if _, err = statsutil.ExecWithCtx(ctx, sctx, fmt.Sprintf("select * from mysql.stats_table_locked where table_id in (%s) for update", lockedTableIDsStr)); err != nil {
+	// Prepare statements for different update types
+	prepareLocked := `
+		PREPARE locked_stmt FROM '
+		insert into mysql.stats_table_locked (version, table_id, modify_count, count)
+		values (?, ?, ?, ?)
+		on duplicate key update
+			version = values(version),
+			modify_count = modify_count + values(modify_count),
+			count = count + values(count)'
+	`
+	if _, err = statsutil.ExecWithCtx(ctx, sctx, prepareLocked); err != nil {
+		return err
+	}
+	defer func() {
+		_, err = statsutil.ExecWithCtx(ctx, sctx, "DEALLOCATE PREPARE locked_stmt")
+		if err != nil {
+			statslogutil.StatsLogger().Warn(
+				"Failed to deallocate the locked_stmt prepared statement",
+				zap.Error(err),
+			)
+		}
+	}()
+
+	prepareUnlockedPos := `
+		PREPARE unlocked_pos_stmt FROM '
+		insert into mysql.stats_meta (version, table_id, modify_count, count)
+		values (?, ?, ?, ?)
+		on duplicate key update
+			version = values(version),
+			modify_count = modify_count + values(modify_count),
+			count = count + values(count)'
+	`
+	if _, err = statsutil.ExecWithCtx(ctx, sctx, prepareUnlockedPos); err != nil {
+		return err
+	}
+	defer func() {
+		_, err = statsutil.ExecWithCtx(ctx, sctx, "DEALLOCATE PREPARE unlocked_pos_stmt")
+		if err != nil {
+			statslogutil.StatsLogger().Warn(
+				"Failed to deallocate the unlocked_pos_stmt prepared statement",
+				zap.Error(err),
+			)
+		}
+	}()
+
+	prepareUnlockedNeg := `
+		PREPARE unlocked_neg_stmt FROM '
+		insert into mysql.stats_meta (version, table_id, modify_count, count)
+		values (?, ?, ?, ?)
+		on duplicate key update
+			version = values(version),
+			modify_count = modify_count + values(modify_count),
+			count = if(count > values(count), count - values(count), 0)'
+	`
+	if _, err = statsutil.ExecWithCtx(ctx, sctx, prepareUnlockedNeg); err != nil {
+		return err
+	}
+	defer func() {
+		_, err = statsutil.ExecWithCtx(ctx, sctx, "DEALLOCATE PREPARE unlocked_neg_stmt")
+		if err != nil {
+			statslogutil.StatsLogger().Warn(
+				"Failed to deallocate the unlocked_neg_stmt prepared statement",
+				zap.Error(err),
+			)
+		}
+	}()
+
+	// Execute locked updates one by one
+	for _, update := range lockedUpdates {
+		setVars := fmt.Sprintf("SET @v1=%d, @v2=%d, @v3=%d, @v4=%d",
+			startTS, update.TableID, update.Delta.Count, update.Delta.Delta)
+		if _, err = statsutil.ExecWithCtx(ctx, sctx, setVars); err != nil {
+			return err
+		}
+
+		if _, err = statsutil.ExecWithCtx(ctx, sctx,
+			"EXECUTE locked_stmt USING @v1, @v2, @v3, @v4"); err != nil {
 			return err
 		}
 	}
 
-	unlockedTableIDsStr := strings.Join(unlockedTableIDs, ",")
-	if unlockedTableIDsStr != "" {
-		if _, err = statsutil.ExecWithCtx(ctx, sctx, fmt.Sprintf("select * from mysql.stats_meta where table_id in (%s) for update", unlockedTableIDsStr)); err != nil {
-			return err
-		}
-	}
-	// Execute locked updates
-	if len(lockedValues) > 0 {
-		sql := fmt.Sprintf("insert into mysql.stats_table_locked (version, table_id, modify_count, count) values %s "+
-			"on duplicate key update version = values(version), modify_count = modify_count + values(modify_count), "+
-			"count = count + values(count)", strings.Join(lockedValues, ","))
-		if _, err = statsutil.ExecWithCtx(ctx, sctx, sql); err != nil {
-			return err
-		}
-	}
+	// Execute unlocked updates one by one
+	for _, update := range unlockedUpdates {
+		var setVars string
+		var execStmt string
 
-	// Execute unlocked updates with positive delta
-	if len(unlockedPosValues) > 0 {
-		sql := fmt.Sprintf("insert into mysql.stats_meta (version, table_id, modify_count, count) values %s "+
-			"on duplicate key update version = values(version), modify_count = modify_count + values(modify_count), "+
-			"count = count + values(count)", strings.Join(unlockedPosValues, ","))
-		if _, err = statsutil.ExecWithCtx(ctx, sctx, sql); err != nil {
+		if update.Delta.Delta < 0 {
+			setVars = fmt.Sprintf("SET @v1=%d, @v2=%d, @v3=%d, @v4=%d",
+				startTS, update.TableID, update.Delta.Count, -update.Delta.Delta)
+			execStmt = "EXECUTE unlocked_neg_stmt USING @v1, @v2, @v3, @v4"
+		} else {
+			setVars = fmt.Sprintf("SET @v1=%d, @v2=%d, @v3=%d, @v4=%d",
+				startTS, update.TableID, update.Delta.Count, update.Delta.Delta)
+			execStmt = "EXECUTE unlocked_pos_stmt USING @v1, @v2, @v3, @v4"
+		}
+
+		if _, err = statsutil.ExecWithCtx(ctx, sctx, setVars); err != nil {
 			return err
 		}
-	}
 
-	// Execute unlocked updates with negative delta
-	if len(unlockedNegValues) > 0 {
-		sql := fmt.Sprintf("insert into mysql.stats_meta (version, table_id, modify_count, count) values %s "+
-			"on duplicate key update version = values(version), modify_count = modify_count + values(modify_count), "+
-			"count = if(count > values(count), count - values(count), 0)", strings.Join(unlockedNegValues, ","))
-		if _, err = statsutil.ExecWithCtx(ctx, sctx, sql); err != nil {
+		if _, err = statsutil.ExecWithCtx(ctx, sctx, execStmt); err != nil {
 			return err
 		}
 	}
