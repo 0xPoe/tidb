@@ -113,19 +113,19 @@ func UpdateStatsMeta(
 		}
 	}
 
-	// Lock the stats_meta and stats_table_locked tables using SELECT FOR UPDATE to prevent write conflicts.
-	// This ensures that we acquire the necessary locks before attempting to update the tables, reducing the likelihood
-	// of encountering lock conflicts during the update process.
+	// Lock the stats_meta and stats_table_locked tables using SELECT FOR UPDATE NOWAIT to prevent deadlock.
+	// This ensures that we acquire the necessary locks before attempting to update the tables.
+	// Since it is NOWAIT, if the lock cannot be acquired, the transaction will be rolled back immediately.
 	lockedTableIDsStr := strings.Join(lockedTableIDs, ",")
 	if lockedTableIDsStr != "" {
-		if _, err = statsutil.ExecWithCtx(ctx, sctx, fmt.Sprintf("select * from mysql.stats_table_locked where table_id in (%s) for update", lockedTableIDsStr)); err != nil {
+		if _, err = statsutil.ExecWithCtx(ctx, sctx, fmt.Sprintf("select * from mysql.stats_table_locked where table_id in (%s) for update nowait", lockedTableIDsStr)); err != nil {
 			return err
 		}
 	}
 
 	unlockedTableIDsStr := strings.Join(unlockedTableIDs, ",")
 	if unlockedTableIDsStr != "" {
-		if _, err = statsutil.ExecWithCtx(ctx, sctx, fmt.Sprintf("select * from mysql.stats_meta where table_id in (%s) for update", unlockedTableIDsStr)); err != nil {
+		if _, err = statsutil.ExecWithCtx(ctx, sctx, fmt.Sprintf("select * from mysql.stats_meta where table_id in (%s) for update nowait", unlockedTableIDsStr)); err != nil {
 			return err
 		}
 	}
