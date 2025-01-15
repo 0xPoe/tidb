@@ -100,6 +100,20 @@ func UpdateStatsMeta(
 		}
 	}
 
+	// Enable tidb_enable_prepared_plan_cache to speed up the prepared statement execution
+	if _, err = statsutil.ExecWithCtx(ctx, sctx, "set tidb_enable_prepared_plan_cache = true"); err != nil {
+		return err
+	}
+	defer func() {
+		_, err = statsutil.ExecWithCtx(ctx, sctx, "set tidb_enable_prepared_plan_cache = false")
+		if err != nil {
+			statslogutil.StatsLogger().Warn(
+				"Failed to disable the prepared plan cache",
+				zap.Error(err),
+			)
+		}
+	}()
+
 	// Prepare statements for different update types
 	prepareLocked := `
 		PREPARE locked_stmt FROM '
