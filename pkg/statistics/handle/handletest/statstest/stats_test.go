@@ -465,3 +465,44 @@ func TestDumpStatsDeltaInBatch(t *testing.T) {
 		"The version of two tables should be the same because they are dumped in the same transaction.",
 	)
 }
+
+func TestAbortDumpStatsDelta(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	testKit := testkit.NewTestKit(t, store)
+	testKit.MustExec("use test")
+	testKit.MustExec("create table t1 (c1 int, c2 int)")
+	testKit.MustExec("insert into t1 values (1, 1), (2, 2), (3, 3)")
+	testKit.MustExec("create table t2 (c1 int, c2 int)")
+	testKit.MustExec("insert into t2 values (1, 1), (2, 2), (3, 3)")
+	// Dump stats delta in one batch to create initial stats.
+	handle := dom.StatsHandle()
+	require.NoError(t, handle.DumpStatsDeltaToKV(true))
+	is := dom.InfoSchema()
+	tbl1, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
+	require.NoError(t, err)
+
+	// Insert more rows.
+	testKit.MustExec("insert into t1 values (4, 4), (5, 5), (6, 6)")
+	testKit.MustExec("insert into t2 values (4, 4), (5, 5), (6, 6)")
+
+	// Start a pessimistic transaction to simulate the situation that the lock is not released.
+	testKit.MustExec("begin pessimistic")
+	testKit.MustExec("select * from mysql.stats_meta where table_id = ? for update nowait", tbl1.Meta().ID)
+
+	require.ErrorContains(t, handle.DumpStatsDeltaToKV(true), "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set")
+
+	// Commit the transaction to release the lock.
+	testKit.MustExec("commit")
+
+	// Dump stats again to check if the stats are updated.
+	require.NoError(t, handle.DumpStatsDeltaToKV(true))
+
+	// Check the mysql.stats_meta table.
+	rows := testKit.MustQuery("select modify_count, count from mysql.stats_meta order by table_id").Rows()
+	require.Len(t, rows, 2)
+
+	require.Equal(t, "6", rows[0][0])
+	require.Equal(t, "6", rows[0][1])
+	require.Equal(t, "6", rows[1][0])
+	require.Equal(t, "6", rows[1][1])
+}
