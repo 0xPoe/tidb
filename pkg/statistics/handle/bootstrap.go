@@ -23,10 +23,6 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/config"
-	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
-	"github.com/pingcap/tidb/pkg/disttask/framework/scheduler"
-	"github.com/pingcap/tidb/pkg/disttask/framework/taskexecutor"
-	"github.com/pingcap/tidb/pkg/disttask/txn"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
@@ -734,16 +730,6 @@ func (h *Handle) InitStatsLite(ctx context.Context) (err error) {
 // To work with auto-analyze's needs, we need to read all stats meta info into memory.
 // The sync/async load of the stats or other process haven't done a full initialization of the table.ColAndIdxExistenceMap. So we need to it here.
 func (h *Handle) InitStats(ctx context.Context, is infoschema.InfoSchema) (err error) {
-	taskexecutor.RegisterTaskType(proto.InitStats,
-		func(ctx context.Context, task *proto.Task, param taskexecutor.Param) taskexecutor.TaskExecutor {
-			return txn.NewTaskExecutor(ctx, task, param, h.Pool.SPool())
-		},
-	)
-
-	scheduler.RegisterSchedulerFactory(proto.InitStats,
-		func(ctx context.Context, task *proto.Task, param scheduler.Param) scheduler.Scheduler {
-			return txn.NewScheduler(ctx, task, param, "init stats")
-		})
 	totalMemory, err := memory.MemTotal()
 	if err != nil {
 		return err

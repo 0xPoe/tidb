@@ -14,6 +14,10 @@
 
 package txn
 
+type taskMeta struct {
+	SQL string `json:"sql"`
+}
+
 type subtaskMeta struct {
 	SQL string `json:"sql"`
 }

@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/disttask/framework/scheduler"
 	"github.com/pingcap/tidb/pkg/disttask/framework/storage"
@@ -33,14 +34,19 @@ type schedulerImpl struct {
 
 var _ scheduler.Scheduler = (*schedulerImpl)(nil)
 
-func NewScheduler(ctx context.Context, task *proto.Task, param scheduler.Param, SQL string) *schedulerImpl {
+func NewScheduler(ctx context.Context, task *proto.Task, param scheduler.Param) *schedulerImpl {
 	return &schedulerImpl{
 		BaseScheduler: scheduler.NewBaseScheduler(ctx, task, param),
-		SQL:           SQL,
 	}
 }
 
 func (s *schedulerImpl) Init() (err error) {
+	taskMeta := &taskMeta{}
+	if err = json.Unmarshal(s.BaseScheduler.GetTask().Meta, taskMeta); err != nil {
+		return errors.Annotate(err, "unmarshal task meta failed")
+	}
+	s.SQL = taskMeta.SQL
+
 	s.BaseScheduler.Extension = s
 	return s.BaseScheduler.Init()
 }
