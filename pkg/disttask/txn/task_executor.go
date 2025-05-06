@@ -18,24 +18,24 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/pingcap/tidb/pkg/ddl/session"
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/disttask/framework/taskexecutor"
 	"github.com/pingcap/tidb/pkg/disttask/framework/taskexecutor/execute"
+	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/logutil"
-	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"go.uber.org/zap"
 )
 
 type taskExecutor struct {
 	*taskexecutor.BaseTaskExecutor
 	ctx         context.Context
-	sessionPool *session.Pool
+	sessionPool util.DestroyableSessionPool
 }
 
 var _ taskexecutor.TaskExecutor = (*taskExecutor)(nil)
 
-func newTaskExecutor(ctx context.Context, task *proto.Task, param taskexecutor.Param, sessionPool *session.Pool) *taskExecutor {
+func NewTaskExecutor(ctx context.Context, task *proto.Task, param taskexecutor.Param, sessionPool util.DestroyableSessionPool) *taskExecutor {
 	e := &taskExecutor{
 		BaseTaskExecutor: taskexecutor.NewBaseTaskExecutor(ctx, task, param),
 		ctx:              ctx,
@@ -63,7 +63,7 @@ func (*taskExecutor) IsRetryableError(error) bool {
 type stepExecutor struct {
 	ctx context.Context
 	taskexecutor.BaseStepExecutor
-	sessionPool *session.Pool
+	sessionPool util.DestroyableSessionPool
 }
 
 func (s *stepExecutor) RunSubtask(_ context.Context, subtask *proto.Subtask) error {
@@ -81,7 +81,9 @@ func (s *stepExecutor) RunSubtask(_ context.Context, subtask *proto.Subtask) err
 	defer s.sessionPool.Put(session)
 
 	sql := stMeta.SQL
-	_, _, err = session.GetRestrictedSQLExecutor().ExecRestrictedSQL(s.ctx, []sqlexec.OptionFuncAlias{}, sql)
+	sctx := session.(sessionctx.Context)
+	sqlExec := sctx.GetSQLExecutor()
+	_, err = sqlExec.ExecuteInternal(s.ctx, sql)
 	if err != nil {
 		return err
 	}

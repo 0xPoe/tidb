@@ -16,6 +16,8 @@ package txn
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/disttask/framework/scheduler"
@@ -26,13 +28,15 @@ import (
 type schedulerImpl struct {
 	*scheduler.BaseScheduler
 	logger *zap.Logger
+	SQL    string
 }
 
 var _ scheduler.Scheduler = (*schedulerImpl)(nil)
 
-func newScheduler(ctx context.Context, task *proto.Task, param scheduler.Param) *schedulerImpl {
+func NewScheduler(ctx context.Context, task *proto.Task, param scheduler.Param, SQL string) *schedulerImpl {
 	return &schedulerImpl{
 		BaseScheduler: scheduler.NewBaseScheduler(ctx, task, param),
+		SQL:           SQL,
 	}
 }
 
@@ -43,6 +47,22 @@ func (s *schedulerImpl) Init() (err error) {
 
 func (s *schedulerImpl) OnTick(context.Context, *proto.Task) {
 	s.logger.Info("OnTick")
+}
+
+func (s *schedulerImpl) OnNextSubtasksBatch(_ context.Context, _ storage.TaskHandle,
+	task *proto.Task, _ []string, nextStep proto.Step) (subtaskMetas [][]byte, err error) {
+	switch nextStep {
+	case proto.StepOne:
+		bytes, err := json.Marshal(&subtaskMeta{
+			SQL: s.SQL,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{bytes}, nil
+	default:
+		panic(fmt.Sprintf("unexpected nextStep: %s", proto.Step2Str(proto.TaskTypeExample, nextStep)))
+	}
 }
 
 func (s *schedulerImpl) OnDone(context.Context, storage.TaskHandle, *proto.Task) error {
