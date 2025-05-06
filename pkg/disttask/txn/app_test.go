@@ -45,7 +45,8 @@ func TestExampleApplication(t *testing.T) {
 	ctx := context.Background()
 	ctx = util.WithInternalSourceType(ctx, "scheduler_manager")
 	meta := &taskMeta{
-		SQL: "init stats",
+		SQL:      "init stats",
+		ServerID: "1",
 	}
 	bytes, err := json.Marshal(meta)
 	require.NoError(t, err)

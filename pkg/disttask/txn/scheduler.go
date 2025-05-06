@@ -71,6 +71,14 @@ func (s *schedulerImpl) OnNextSubtasksBatch(_ context.Context, _ storage.TaskHan
 	}
 }
 
+func (s *schedulerImpl) GetEligibleInstances(_ context.Context, task *proto.Task) ([]string, error) {
+	taskMeta := &taskMeta{}
+	if err := json.Unmarshal(task.Meta, taskMeta); err != nil {
+		return nil, errors.Annotate(err, "unmarshal task meta failed")
+	}
+	return []string{taskMeta.ServerID}, nil
+}
+
 func (s *schedulerImpl) OnDone(context.Context, storage.TaskHandle, *proto.Task) error {
 	s.logger.Info("OnDone")
 	return nil
