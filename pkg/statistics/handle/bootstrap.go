@@ -734,13 +734,13 @@ func (h *Handle) InitStatsLite(ctx context.Context) (err error) {
 // To work with auto-analyze's needs, we need to read all stats meta info into memory.
 // The sync/async load of the stats or other process haven't done a full initialization of the table.ColAndIdxExistenceMap. So we need to it here.
 func (h *Handle) InitStats(ctx context.Context, is infoschema.InfoSchema) (err error) {
-	taskexecutor.RegisterTaskType(proto.Backfill,
+	taskexecutor.RegisterTaskType(proto.InitStats,
 		func(ctx context.Context, task *proto.Task, param taskexecutor.Param) taskexecutor.TaskExecutor {
 			return txn.NewTaskExecutor(ctx, task, param, h.Pool.SPool())
 		},
 	)
 
-	scheduler.RegisterSchedulerFactory(proto.Backfill,
+	scheduler.RegisterSchedulerFactory(proto.InitStats,
 		func(ctx context.Context, task *proto.Task, param scheduler.Param) scheduler.Scheduler {
 			return txn.NewScheduler(ctx, task, param, "init stats")
 		})
