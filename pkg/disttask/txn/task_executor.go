@@ -18,22 +18,28 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/pingcap/tidb/pkg/ddl/session"
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/disttask/framework/taskexecutor"
 	"github.com/pingcap/tidb/pkg/disttask/framework/taskexecutor/execute"
 	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"go.uber.org/zap"
 )
 
 type taskExecutor struct {
 	*taskexecutor.BaseTaskExecutor
+	ctx         context.Context
+	sessionPool *session.Pool
 }
 
 var _ taskexecutor.TaskExecutor = (*taskExecutor)(nil)
 
-func newTaskExecutor(ctx context.Context, task *proto.Task, param taskexecutor.Param) *taskExecutor {
+func newTaskExecutor(ctx context.Context, task *proto.Task, param taskexecutor.Param, sessionPool *session.Pool) *taskExecutor {
 	e := &taskExecutor{
 		BaseTaskExecutor: taskexecutor.NewBaseTaskExecutor(ctx, task, param),
+		ctx:              ctx,
+		sessionPool:      sessionPool,
 	}
 	e.BaseTaskExecutor.Extension = e
 	return e
@@ -43,8 +49,11 @@ func (*taskExecutor) IsIdempotent(*proto.Subtask) bool {
 	return true
 }
 
-func (*taskExecutor) GetStepExecutor(*proto.Task) (execute.StepExecutor, error) {
-	return &stepExecutor{}, nil
+func (t *taskExecutor) GetStepExecutor(*proto.Task) (execute.StepExecutor, error) {
+	return &stepExecutor{
+		ctx:         t.ctx,
+		sessionPool: t.sessionPool,
+	}, nil
 }
 
 func (*taskExecutor) IsRetryableError(error) bool {
@@ -52,15 +61,30 @@ func (*taskExecutor) IsRetryableError(error) bool {
 }
 
 type stepExecutor struct {
+	ctx context.Context
 	taskexecutor.BaseStepExecutor
+	sessionPool *session.Pool
 }
 
-func (*stepExecutor) RunSubtask(_ context.Context, subtask *proto.Subtask) error {
+func (s *stepExecutor) RunSubtask(_ context.Context, subtask *proto.Subtask) error {
 	stMeta := subtaskMeta{}
 	if err := json.Unmarshal(subtask.Meta, &stMeta); err != nil {
 		return err
 	}
 	logutil.BgLogger().Info("RunSubtask", zap.Int64("subtaskID", subtask.ID),
 		zap.String("sql", stMeta.SQL))
+
+	session, err := s.sessionPool.Get()
+	if err != nil {
+		return err
+	}
+	defer s.sessionPool.Put(session)
+
+	sql := stMeta.SQL
+	_, _, err = session.GetRestrictedSQLExecutor().ExecRestrictedSQL(s.ctx, []sqlexec.OptionFuncAlias{}, sql)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
