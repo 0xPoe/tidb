@@ -12440,8 +12440,6 @@ Statement:
 |	RevokeStmt
 |	RevokeRoleStmt
 |	RefreshStatsStmt
-|	RefreshObjects
-|	RefreshObject
 |	SavepointStmt
 |	SetOprStmt
 |	SelectStmt
