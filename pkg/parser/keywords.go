@@ -670,6 +670,7 @@ var Keywords = []KeywordsType{
 	{"REGION", false, "tidb"},
 	{"REGIONS", false, "tidb"},
 	{"RESET", false, "tidb"},
+	{"REFRESH", false, "tidb"},
 	{"RUN", false, "tidb"},
 	{"SAMPLERATE", false, "tidb"},
 	{"SAMPLES", false, "tidb"},

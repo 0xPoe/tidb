@@ -883,6 +883,7 @@ import (
 	region                     "REGION"
 	regions                    "REGIONS"
 	reset                      "RESET"
+	refresh                    "REFRESH"
 	run                        "RUN"
 	sampleRate                 "SAMPLERATE"
 	samples                    "SAMPLES"
@@ -1054,6 +1055,9 @@ import (
 	RevokeRoleStmt             "Revoke role statement"
 	RollbackStmt               "ROLLBACK statement"
 	ReleaseSavepointStmt       "RELEASE SAVEPOINT statement"
+	RefreshStatsStmt           "REFRESH STATS statement"
+	RefreshObjects             "Refresh object list"
+	RefreshObject              "Refresh object"
 	SavepointStmt              "SAVEPOINT statement"
 	SplitRegionStmt            "Split index region statement"
 	SetStmt                    "Set variable statement"
@@ -12435,6 +12439,9 @@ Statement:
 |	ReleaseSavepointStmt
 |	RevokeStmt
 |	RevokeRoleStmt
+|	RefreshStatsStmt
+|	RefreshObjects
+|	RefreshObject
 |	SavepointStmt
 |	SetOprStmt
 |	SelectStmt
@@ -15481,6 +15488,60 @@ UnlockStatsStmt:
 		x.PartitionNames = $6.([]ast.CIStr)
 		$$ = &ast.UnlockStatsStmt{
 			Tables: []*ast.TableName{x},
+		}
+	}
+
+RefreshStatsStmt:
+	"REFRESH" "STATS" RefreshObjects
+	{
+		$$ = &ast.RefreshStatsStmt{
+			RefreshObjects: $3.([]ast.RefreshObject),
+		}
+	}
+
+RefreshObjects:
+	RefreshObject
+	{
+		$$ = []ast.RefreshObject{$1.(ast.RefreshObject)}
+	}
+|	RefreshObjects ',' RefreshObject
+	{
+		$$ = append($1.([]ast.RefreshObject), $3.(ast.RefreshObject))
+	}
+
+RefreshObject:
+	'*'
+	{
+		$$ = ast.RefreshObject{
+			RefreshObjectScope: ast.RefreshObjectScopeDatabase,
+		}
+	}
+|	'*' '.' '*'
+	{
+		$$ = ast.RefreshObject{
+			RefreshObjectScope: ast.RefreshObjectScopeAll,
+		}
+	}
+|	Identifier '.' '*'
+	{
+		$$ = ast.RefreshObject{
+			RefreshObjectScope: ast.RefreshObjectScopeTable,
+			DBName:             $1,
+		}
+	}
+|	Identifier '.' Identifier
+	{
+		$$ = ast.RefreshObject{
+			RefreshObjectScope: ast.RefreshObjectScopeTable,
+			DBName:             $1,
+			TableName:          $3,
+		}
+	}
+|	Identifier
+	{
+		$$ = ast.RefreshObject{
+			RefreshObjectScope: ast.RefreshObjectScopeTable,
+			TableName:          $1,
 		}
 	}
 

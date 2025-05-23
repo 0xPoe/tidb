@@ -348,3 +348,61 @@ func (n *UnlockStatsStmt) Accept(v Visitor) (Node, bool) {
 	}
 	return v.Leave(n)
 }
+
+type RefreshStatsStmt struct {
+	stmtNode
+
+	RefreshObjects []RefreshObject
+}
+
+func (n *RefreshStatsStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("REFRESH STATS ")
+	for index, refreshObject := range n.RefreshObjects {
+		if index != 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := refreshObject.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore RefreshStatsStmt.RefreshObjects[%d]", index)
+		}
+	}
+	return nil
+}
+
+func (n *RefreshStatsStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*RefreshStatsStmt)
+	return v.Leave(n)
+}
+
+type RefreshObject struct {
+	RefreshObjectScope RefreshObjectScopeType
+	DBName             string
+	TableName          string
+}
+
+func (o *RefreshObject) Restore(ctx *format.RestoreCtx) error {
+	switch o.RefreshObjectScope {
+	case RefreshObjectScopeTable:
+		if o.DBName != "" {
+			ctx.WriteName(o.DBName)
+			ctx.WritePlain(".")
+		}
+		ctx.WriteName(o.TableName)
+	case RefreshObjectScopeDatabase:
+		ctx.WriteName(o.DBName)
+	case RefreshObjectScopeAll:
+		ctx.WritePlain("*")
+	}
+	return nil
+}
+
+type RefreshObjectScopeType int
+
+const (
+	RefreshObjectScopeTable RefreshObjectScopeType = iota + 1
+	RefreshObjectScopeDatabase
+	RefreshObjectScopeAll
+)
