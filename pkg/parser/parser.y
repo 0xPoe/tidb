@@ -1056,8 +1056,6 @@ import (
 	RollbackStmt               "ROLLBACK statement"
 	ReleaseSavepointStmt       "RELEASE SAVEPOINT statement"
 	RefreshStatsStmt           "REFRESH STATS statement"
-	RefreshObjects             "Refresh object list"
-	RefreshObject              "Refresh object"
 	SavepointStmt              "SAVEPOINT statement"
 	SplitRegionStmt            "Split index region statement"
 	SetStmt                    "Set variable statement"
@@ -1297,6 +1295,8 @@ import (
 	Priority                               "Statement priority"
 	PriorityOpt                            "Statement priority option"
 	PrivElem                               "Privilege element"
+	RefreshObject                          "Refresh object"
+	RefreshObjectList                      "Refresh object list"
 	PrivLevel                              "Privilege scope"
 	PrivType                               "Privilege type"
 	ReferDef                               "Reference definition"
@@ -15490,46 +15490,46 @@ UnlockStatsStmt:
 	}
 
 RefreshStatsStmt:
-	"REFRESH" "STATS" RefreshObjects
+	"REFRESH" "STATS" RefreshObjectList
 	{
 		$$ = &ast.RefreshStatsStmt{
-			RefreshObjects: $3.([]ast.RefreshObject),
+			RefreshObjects: $3.([]*ast.RefreshObject),
 		}
 	}
 
-RefreshObjects:
+RefreshObjectList:
 	RefreshObject
 	{
-		$$ = []ast.RefreshObject{$1.(ast.RefreshObject)}
+		$$ = []*ast.RefreshObject{$1.(*ast.RefreshObject)}
 	}
-|	RefreshObjects ',' RefreshObject
+|	RefreshObjectList ',' RefreshObject
 	{
-		$$ = append($1.([]ast.RefreshObject), $3.(ast.RefreshObject))
+		$$ = append($1.([]*ast.RefreshObject), $3.(*ast.RefreshObject))
 	}
 
 RefreshObject:
 	'*'
 	{
-		$$ = ast.RefreshObject{
+		$$ = &ast.RefreshObject{
 			RefreshObjectScope: ast.RefreshObjectScopeDatabase,
 		}
 	}
 |	'*' '.' '*'
 	{
-		$$ = ast.RefreshObject{
+		$$ = &ast.RefreshObject{
 			RefreshObjectScope: ast.RefreshObjectScopeAll,
 		}
 	}
 |	Identifier '.' '*'
 	{
-		$$ = ast.RefreshObject{
+		$$ = &ast.RefreshObject{
 			RefreshObjectScope: ast.RefreshObjectScopeTable,
 			DBName:             $1,
 		}
 	}
 |	Identifier '.' Identifier
 	{
-		$$ = ast.RefreshObject{
+		$$ = &ast.RefreshObject{
 			RefreshObjectScope: ast.RefreshObjectScopeTable,
 			DBName:             $1,
 			TableName:          $3,
@@ -15537,7 +15537,7 @@ RefreshObject:
 	}
 |	Identifier
 	{
-		$$ = ast.RefreshObject{
+		$$ = &ast.RefreshObject{
 			RefreshObjectScope: ast.RefreshObjectScopeTable,
 			TableName:          $1,
 		}

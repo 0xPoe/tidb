@@ -22,6 +22,7 @@ var (
 	_ StmtNode = &AnalyzeTableStmt{}
 	_ StmtNode = &DropStatsStmt{}
 	_ StmtNode = &LoadStatsStmt{}
+	_ StmtNode = &RefreshStatsStmt{}
 )
 
 // AnalyzeTableStmt is used to create table statistics.
@@ -352,7 +353,7 @@ func (n *UnlockStatsStmt) Accept(v Visitor) (Node, bool) {
 type RefreshStatsStmt struct {
 	stmtNode
 
-	RefreshObjects []RefreshObject
+	RefreshObjects []*RefreshObject
 }
 
 func (n *RefreshStatsStmt) Restore(ctx *format.RestoreCtx) error {
@@ -377,6 +378,14 @@ func (n *RefreshStatsStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+type RefreshObjectScopeType int
+
+const (
+	RefreshObjectScopeTable RefreshObjectScopeType = iota + 1
+	RefreshObjectScopeDatabase
+	RefreshObjectScopeAll
+)
+
 type RefreshObject struct {
 	RefreshObjectScope RefreshObjectScopeType
 	DBName             string
@@ -398,11 +407,3 @@ func (o *RefreshObject) Restore(ctx *format.RestoreCtx) error {
 	}
 	return nil
 }
-
-type RefreshObjectScopeType int
-
-const (
-	RefreshObjectScopeTable RefreshObjectScopeType = iota + 1
-	RefreshObjectScopeDatabase
-	RefreshObjectScopeAll
-)
