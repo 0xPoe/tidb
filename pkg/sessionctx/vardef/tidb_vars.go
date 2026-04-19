@@ -1063,6 +1063,12 @@ const (
 
 	// TiDBAccelerateUserCreationUpdate decides whether tidb will load & update the whole user's data in-memory.
 	TiDBAccelerateUserCreationUpdate = "tidb_accelerate_user_creation_update"
+
+	// TiDBCoprResolveLockLite controls whether coprocessor uses resolve lock lite instead of resolve lock.
+	TiDBCoprResolveLockLite = "tidb_copr_resolve_lock_lite"
+
+	// TiDBCoprSyncResolveLock controls whether coprocessor resolves locks synchronously.
+	TiDBCoprSyncResolveLock = "tidb_copr_sync_resolve_lock"
 )
 
 // TiDB vars that have only global scope
@@ -1717,6 +1723,8 @@ const (
 	DefTiDBTSOClientRPCMode                           = TSOClientRPCModeDefault
 	DefTiDBCircuitBreakerPDMetaErrorRateRatio         = 0.0
 	DefTiDBAccelerateUserCreationUpdate               = false
+	DefTiDBCoprResolveLockLite                        = true
+	DefTiDBCoprSyncResolveLock                        = true
 	DefTiDBEnableTSValidation                         = true
 	DefTiDBLoadBindingTimeout                         = 200
 	DefTiDBAdvancerCheckPointLagLimit                 = 48 * time.Hour

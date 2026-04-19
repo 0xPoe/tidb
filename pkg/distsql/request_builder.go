@@ -373,6 +373,8 @@ func (builder *RequestBuilder) SetFromSessionVars(dctx *distsqlctx.DistSQLContex
 	builder.Request.RunawayChecker = dctx.RunawayChecker
 	builder.Request.TiKVClientReadTimeout = dctx.TiKVClientReadTimeout
 	builder.Request.MaxExecutionTime = dctx.MaxExecutionTime
+	builder.Request.CoprResolveLockLite = dctx.CoprResolveLockLite
+	builder.Request.CoprSyncResolveLock = dctx.CoprSyncResolveLock
 	return builder
 }
 

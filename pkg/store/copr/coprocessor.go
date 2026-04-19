@@ -1213,7 +1213,7 @@ func newCopIteratorWorker(it *copIterator, taskCh <-chan *copTask) *copIteratorW
 		respChan:                it.respChan,
 		finishCh:                it.finishCh,
 		vars:                    it.vars,
-		kvclient:                txnsnapshot.NewClientHelper(it.store.store, &it.resolvedLocks, &it.committedLocks, false),
+		kvclient:                txnsnapshot.NewClientHelper(it.store.store, &it.resolvedLocks, &it.committedLocks, it.req.CoprResolveLockLite),
 		memTracker:              it.memTracker,
 		replicaReadSeed:         it.replicaReadSeed,
 		pagingTaskIdx:           &it.pagingTaskIdx,
@@ -2370,6 +2370,7 @@ func (worker *copIteratorWorker) handleLockErr(bo *Backoffer, lockErr *kvrpcpb.L
 		CallerStartTS: worker.req.StartTs,
 		Locks:         []*txnlock.Lock{txnlock.NewLock(lockErr)},
 		Detail:        resolveLockDetail,
+		SyncResolve:   worker.req.CoprSyncResolveLock,
 	}
 	resolveLocksRes, err1 := worker.kvclient.ResolveLocksWithOpts(bo.TiKVBackoffer(), resolveLocksOpts)
 	err1 = derr.ToTiDBErr(err1)
