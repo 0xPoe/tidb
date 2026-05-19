@@ -1865,13 +1865,259 @@ func MergePartTopNAndHistToGlobal(
 	return globalTopN, globalHist, nil
 }
 
+// bucketBuilder constructs an equi-depth histogram from grouped input.
+// Callers feed it one "group" (a set of items sharing an encoded key)
+// at a time: startGroup, then addToGroup for each contribution, then
+// emit. emit closes the in-progress bucket when its mass reaches
+// target, choosing between cutting at the current group's upper
+// (default) and cutting at the previous group's upper (cut-at-prev
+// rebalancing). After the last group, flush appends any remaining
+// in-progress data as the trailing bucket.
+//
+// Optional Datum fields use *types.Datum where nil means "unset"; a
+// setter copies the source value into a fresh local that escapes via
+// the field, so the pointer remains valid after addToGroup's argument
+// storage is reused on the next call.
+type bucketBuilder struct {
+	sc              *stmtctx.StatementContext
+	out             *Histogram
+	target          int64
+	expBucketNumber int64
+
+	cumCount, prevCumCount int64
+	lastRepeat, prevRepeat int64
+
+	bucketLower       *types.Datum
+	currentGroupLower *types.Datum
+	lastUpper         *types.Datum
+	prevUpper         *types.Datum
+
+	lowerFloor *types.Datum
+}
+
+// newBucketBuilder returns a builder writing into out. target is the
+// per-bucket mass each emit aims for; it's derived from totHistCount
+// (rounded up to at least 1 to avoid never-emit).
+//
+// Buckets that overshoot target (e.g. when a single fat group pushes
+// the bucket past it) don't make later buckets smaller as compensation;
+// subsequent buckets aim for the same target afresh. This trades the
+// strict cumulative-equi-depth invariant for uniform per-bucket sizing,
+// with the consequence that we may emit fewer than expBucketNumber
+// buckets when the data overshoots a lot.
+func newBucketBuilder(sc *stmtctx.StatementContext, out *Histogram, totHistCount, expBucketNumber int64) *bucketBuilder {
+	return &bucketBuilder{
+		sc:              sc,
+		out:             out,
+		target:          max(totHistCount/expBucketNumber, 1),
+		expBucketNumber: expBucketNumber,
+	}
+}
+
+// startGroup begins a new group with the given upper key. Subsequent
+// addToGroup calls contribute to this group; emit may then close the
+// in-progress bucket at this group's upper (or the previous group's
+// upper via cut-at-prev).
+func (b *bucketBuilder) startGroup(upper *types.Datum) {
+	b.prevCumCount = b.cumCount
+	if b.lastUpper != nil {
+		b.prevUpper = b.lastUpper
+	}
+	b.prevRepeat = b.lastRepeat
+	b.lastRepeat = 0
+	u := *upper
+	b.lastUpper = &u
+	b.currentGroupLower = nil
+}
+
+// addToGroup adds (count, repeat) mass to the in-progress bucket and
+// tracks the minimum lower across the current group and the in-progress
+// bucket. The incoming lower is clamped to lowerFloor so adjacent
+// buckets don't overlap.
+func (b *bucketBuilder) addToGroup(lower *types.Datum, count, repeat int64) error {
+	b.cumCount += count
+	b.lastRepeat += repeat
+	lo, err := b.clampToFloor(lower)
+	if err != nil {
+		return err
+	}
+	if err := b.updateMin(&b.currentGroupLower, lo); err != nil {
+		return err
+	}
+	return b.updateMin(&b.bucketLower, lo)
+}
+
+// emit closes the in-progress bucket if it has reached target mass.
+// It's a no-op when the current group contributed nothing (a TopN-match
+// group whose Repeat fully accounted for the bucket count), when only
+// the trailing slot remains in the budget, or when the in-progress
+// bucket hasn't reached target yet.
+func (b *bucketBuilder) emit() error {
+	if b.cumCount <= b.prevCumCount {
+		return nil
+	}
+	// Reserve the last bucket slot for flush, which captures whatever
+	// in-progress data didn't reach target on its own.
+	if int64(len(b.out.Buckets)) >= b.expBucketNumber-1 {
+		return nil
+	}
+	if b.cumCount-b.lastEmittedCum() < b.target {
+		return nil
+	}
+
+	cutUpper, cutCount, cutRepeat, cutAtPrev, err := b.pickCut()
+	if err != nil {
+		return err
+	}
+
+	intest.Assert(b.bucketLower != nil, "bucketBuilder.emit: addToGroup didn't seed bucketLower")
+
+	b.out.AppendBucketWithNDV(b.bucketLower, cutUpper, cutCount, cutRepeat, 0)
+	floor := *cutUpper
+	b.lowerFloor = &floor
+
+	if cutAtPrev && b.currentGroupLower != nil {
+		// Cut-at-prev carries the current group's data to the next
+		// bucket. Seed bucketLower from currentGroupLower so the next
+		// bucket's lower reflects the carried data range; otherwise
+		// the carried group's lower would be lost when the next group
+		// resets bucketLower from its own (possibly higher) lower
+		// bound. Re-clamp against the new lowerFloor (= cutUpper just
+		// set above) because the current group's addToGroup clamped
+		// against the previous floor, which can be lower than cutUpper
+		// when the cut falls between two earlier emits.
+		b.bucketLower, err = b.clampToFloor(b.currentGroupLower)
+		if err != nil {
+			return err
+		}
+	} else {
+		b.bucketLower = nil
+	}
+	return nil
+}
+
+// flush appends any in-progress data as the trailing bucket. Call once
+// at the end of the walk.
+func (b *bucketBuilder) flush() {
+	if b.bucketLower != nil && b.lastUpper != nil {
+		b.out.AppendBucketWithNDV(b.bucketLower, b.lastUpper, b.cumCount, b.lastRepeat, 0)
+	}
+}
+
+// lastEmittedCum returns the cumulative count of the most recently
+// emitted bucket (0 before any emit).
+func (b *bucketBuilder) lastEmittedCum() int64 {
+	if n := len(b.out.Buckets); n > 0 {
+		return b.out.Buckets[n-1].Count
+	}
+	return 0
+}
+
+// pickCut chooses the cut position for emit's bucket: either lastUpper
+// (the default, cut at the end of the current group) or prevUpper
+// (cut-at-prev rebalancing, cut at the end of the prior group,
+// carrying the current group forward to the next bucket).
+//
+// Cut-at-prev is preferred when the prior cut would yield a bucket
+// whose mass is closer to target than the default cut would. It is
+// suppressed in two cases:
+//
+//  1. prevUpper below bucketLower, would produce inverted bounds
+//     (this happens when the previous group's upper was already used
+//     as a recent bucket's cut and the current group's data then
+//     raised bucketLower above it).
+//  2. prevCumCount ≤ the previously emitted bucket's cumulative, the
+//     resulting bucket would carry zero mass (a "ghost" bucket
+//     spanning the gap between two previously emitted ranges) and
+//     waste a slot in the budget. Happens when one or more groups
+//     between the previous emit and now contributed nothing to
+//     cumCount, e.g. a globalTopN-matched group whose entire bucket
+//     mass gets subtracted out.
+func (b *bucketBuilder) pickCut() (
+	cutUpper *types.Datum, cutCount, cutRepeat int64, cutAtPrev bool, err error,
+) {
+	// Default: cut at lastUpper (end of current group).
+	cutUpper = b.lastUpper
+	cutCount = b.cumCount
+	cutRepeat = b.lastRepeat
+
+	if b.prevUpper == nil {
+		return
+	}
+	emittedCum := b.lastEmittedCum()
+	prevDelta := b.prevCumCount - emittedCum
+	currDelta := b.cumCount - emittedCum
+	// Pick whichever cut sits closer to target. When prevDelta is
+	// already past target (e.g. a fat group carried forward by a
+	// previous cut-at-prev now occupies the in-progress bucket),
+	// (target - prevDelta) goes negative and the comparison still
+	// holds: prev is the smaller overshoot and wins.
+	if (b.target - prevDelta) >= (currDelta - b.target) {
+		return
+	}
+	if b.bucketLower != nil {
+		var c int
+		c, err = b.prevUpper.Compare(b.sc.TypeCtx(), b.bucketLower, collate.GetBinaryCollator())
+		if err != nil {
+			return
+		}
+		if c < 0 {
+			return // case 1: would invert bounds
+		}
+	}
+	if b.prevCumCount <= emittedCum {
+		return // case 2: would create a ghost (zero-mass) bucket
+	}
+	cutUpper = b.prevUpper
+	cutCount = b.prevCumCount
+	cutRepeat = b.prevRepeat
+	cutAtPrev = true
+	return
+}
+
+// clampToFloor returns max(d, b.lowerFloor) so the result is never
+// below the upper of the most recently emitted bucket. When lowerFloor
+// is unset (no emit yet), d passes through unchanged.
+func (b *bucketBuilder) clampToFloor(d *types.Datum) (*types.Datum, error) {
+	if b.lowerFloor == nil {
+		return d, nil
+	}
+	c, err := d.Compare(b.sc.TypeCtx(), b.lowerFloor, collate.GetBinaryCollator())
+	if err != nil {
+		return nil, err
+	}
+	if c < 0 {
+		return b.lowerFloor, nil
+	}
+	return d, nil
+}
+
+// updateMin sets *dst = min(*dst, src). When *dst is nil or src wins,
+// src is shallow-copied into a fresh local so the saved pointer
+// survives the caller's reuse of src's underlying storage.
+func (b *bucketBuilder) updateMin(dst **types.Datum, src *types.Datum) error {
+	if *dst == nil {
+		v := *src
+		*dst = &v
+		return nil
+	}
+	c, err := src.Compare(b.sc.TypeCtx(), *dst, collate.GetBinaryCollator())
+	if err != nil {
+		return err
+	}
+	if c < 0 {
+		v := *src
+		*dst = &v
+	}
+	return nil
+}
+
 // buildGlobalHistogram is Pass 2 of MergePartTopNAndHistToGlobal. It
 // merge-walks sortedRefs (per-partition histogram bucket refs in
 // upper-bound order) and allTopN (leftover TopN entries in encoded-key
-// order), building an equi-depth global histogram by emitting a bucket
-// each time the in-progress bucket's mass reaches target. Each iteration
-// emits exactly one "group", a set of items sharing the same encoded
-// key. Three flavors:
+// order), building an equi-depth global histogram via bucketBuilder.
+// Each iteration emits exactly one "group", a set of items sharing the
+// same encoded key. Three flavors:
 //
 //	topN-only : next leftover TopN key < next hist upper (or hist
 //	            exhausted). The TopN entry forms a single-point group,
@@ -1885,9 +2131,10 @@ func MergePartTopNAndHistToGlobal(
 //	            entry's count is folded into the same group as the hist
 //	            bucket(s).
 //
-// Per group: startNewGroup, then addToGroup for each TopN entry or
-// partition bucket contributing to it, then emitGroup. After the
-// loop, the trailing in-progress bucket is appended.
+// Per group: builder.startGroup, then builder.addToGroup for each TopN
+// entry or partition bucket contributing to it, then builder.emit.
+// After the loop, builder.flush appends the trailing in-progress
+// bucket.
 func buildGlobalHistogram(
 	sc *stmtctx.StatementContext,
 	killer *sqlkiller.SQLKiller,
@@ -1910,28 +2157,7 @@ func buildGlobalHistogram(
 		return globalHist, nil
 	}
 
-	// Pass 2 state. Optional Datums use *types.Datum where nil means
-	// "unset"; setting copies the source value into a fresh local that
-	// escapes via closure capture, so the pointer remains valid after
-	// addToGroup's argument storage is reused on the next call.
-	var (
-		// Counters.
-		cumCount, prevCumCount int64
-		lastRepeat, prevRepeat int64
-
-		// In-progress bucket and current group.
-		bucketLower       *types.Datum // current bucket's lower (min so far)
-		lastUpper         *types.Datum // current group's upper (set by startNewGroup)
-		currentGroupLower *types.Datum // min lower seen in the current group's addToGroup;
-		// when emitGroup cuts at prevUpper the current group's data is carried
-		// over to the next bucket, so this becomes that bucket's lower.
-
-		// Carried over from the previous group, for cut-at-prev.
-		prevUpper *types.Datum
-
-		// Floor for clamping addToGroup's lower against earlier emits.
-		lowerFloor *types.Datum
-	)
+	builder := newBucketBuilder(sc, globalHist, totHistCount, expBucketNumber)
 
 	// Scratch Datums reused across extractions. DatumWithBuffer is a
 	// setter-only fill: the previous call's fields (k, i, b, x) are
@@ -1976,202 +2202,6 @@ func buildGlobalHistogram(
 		return ok, nil
 	}
 
-	// target is the size each bucket aims for. Each emit closes the
-	// in-progress bucket when its own mass (cumCount minus the previous
-	// emit's cumulative) reaches target, independent of how many
-	// buckets have been emitted so far. Buckets that overshoot target
-	// (e.g. when a single fat group pushes the bucket past it) don't
-	// make later buckets smaller as compensation; subsequent buckets
-	// aim for the same target afresh.
-	// This trades the strict cumulative-equi-depth invariant for
-	// uniform per-bucket sizing, with the consequence that we may emit
-	// fewer than expBucketNumber buckets when the data overshoots a lot.
-	target := max(totHistCount/expBucketNumber, 1)
-
-	// lastEmittedCum returns the cumulative count of the most recently
-	// emitted bucket (0 before any emit). Used by emitGroup and pickCut
-	// to compute the in-progress bucket's mass since the previous emit.
-	lastEmittedCum := func() int64 {
-		if n := len(globalHist.Buckets); n > 0 {
-			return globalHist.Buckets[n-1].Count
-		}
-		return 0
-	}
-
-	// pickCut chooses the cut position for emitGroup's bucket: either
-	// lastUpper (the default, cut at the end of the current group) or
-	// prevUpper (cut-at-prev rebalancing, cut at the end of the prior
-	// group, carrying the current group forward to the next bucket).
-	//
-	// Cut-at-prev is preferred when the prior cut would yield a bucket
-	// whose mass is closer to target than the default cut would. It is
-	// suppressed in two cases:
-	//
-	//   1. prevUpper below bucketLower, would produce inverted bounds
-	//      (this happens when the previous group's upper was already
-	//      used as a recent bucket's cut and the current group's data
-	//      then raised bucketLower above it).
-	//   2. prevCumCount ≤ the previously emitted bucket's cumulative,
-	//      the resulting bucket would carry zero mass (a "ghost"
-	//      bucket spanning the gap between two previously emitted
-	//      ranges) and waste a slot in the budget. Happens when one
-	//      or more groups between the previous emit and now
-	//      contributed nothing to cumCount, e.g. a globalTopN-matched
-	//      group whose entire bucket mass gets subtracted out.
-	pickCut := func() (
-		cutUpper *types.Datum, cutCount, cutRepeat int64, cutAtPrev bool, err error,
-	) {
-		// Default: cut at lastUpper (end of current group).
-		cutUpper = lastUpper
-		cutCount = cumCount
-		cutRepeat = lastRepeat
-
-		if prevUpper == nil {
-			return
-		}
-		emittedCum := lastEmittedCum()
-		prevDelta := prevCumCount - emittedCum
-		currDelta := cumCount - emittedCum
-		// Pick whichever cut sits closer to target. When prevDelta is
-		// already past target (e.g. a fat group carried forward by a
-		// previous cut-at-prev now occupies the in-progress bucket),
-		// (target - prevDelta) goes negative and the comparison still
-		// holds: prev is the smaller overshoot and wins.
-		if (target - prevDelta) >= (currDelta - target) {
-			return
-		}
-		if bucketLower != nil {
-			var c int
-			c, err = prevUpper.Compare(sc.TypeCtx(), bucketLower, collate.GetBinaryCollator())
-			if err != nil {
-				return
-			}
-			if c < 0 {
-				return // case 1: would invert bounds
-			}
-		}
-		if prevCumCount <= emittedCum {
-			return // case 2: would create a ghost (zero-mass) bucket
-		}
-		cutUpper = prevUpper
-		cutCount = prevCumCount
-		cutRepeat = prevRepeat
-		cutAtPrev = true
-		return
-	}
-
-	emitGroup := func() error {
-		// startNewGroup snapshots prevCumCount := cumCount, so this
-		// group is empty when addToGroup never ran for it. That
-		// happens when every partition bucket in the group was a
-		// TopN-match whose Repeat fully accounted for its count
-		// (count - repeat == 0, see the TopN-match subtraction
-		// above), so there is no histogram-side mass to emit.
-		if cumCount <= prevCumCount {
-			return nil
-		}
-		// Reserve the last bucket slot for the trailing append after
-		// the merge walk (it captures whatever in-progress data didn't
-		// reach target on its own).
-		if int64(len(globalHist.Buckets)) >= expBucketNumber-1 {
-			return nil
-		}
-		if cumCount-lastEmittedCum() < target {
-			return nil
-		}
-
-		cutUpper, cutCount, cutRepeat, cutAtPrev, err := pickCut()
-		if err != nil {
-			return err
-		}
-
-		intest.Assert(bucketLower != nil, "emitGroup: addToGroup didn't seed bucketLower")
-
-		globalHist.AppendBucketWithNDV(bucketLower, cutUpper, cutCount, cutRepeat, 0)
-		floor := *cutUpper
-		lowerFloor = &floor
-
-		if cutAtPrev && currentGroupLower != nil {
-			// Cut at prevUpper carries the current group's data
-			// to the next bucket. Seed bucketLower from the
-			// current group so the next bucket's lower reflects
-			// the carried data range; otherwise the carried
-			// group's lower would be lost when the next group
-			// resets bucketLower from its own (possibly higher)
-			// lower bound. Re-clamp against the new lowerFloor
-			// (= cutUpper just set above) because the current
-			// group's addToGroup clamped against the previous
-			// floor, which can be lower than cutUpper when the
-			// cut falls between two earlier emits.
-			c, err := currentGroupLower.Compare(sc.TypeCtx(), lowerFloor, collate.GetBinaryCollator())
-			if err != nil {
-				return err
-			}
-			if c >= 0 {
-				bucketLower = currentGroupLower
-			} else {
-				bucketLower = lowerFloor
-			}
-		} else {
-			bucketLower = nil
-		}
-		return nil
-	}
-
-	startNewGroup := func(upper *types.Datum) {
-		prevCumCount = cumCount
-		if lastUpper != nil {
-			prevUpper = lastUpper
-		}
-		prevRepeat = lastRepeat
-		lastRepeat = 0
-		u := *upper
-		lastUpper = &u
-		currentGroupLower = nil
-	}
-
-	addToGroup := func(lower *types.Datum, count, repeat int64) error {
-		cumCount += count
-		lastRepeat += repeat
-		lo := lower
-		if lowerFloor != nil {
-			c, err := lo.Compare(sc.TypeCtx(), lowerFloor, collate.GetBinaryCollator())
-			if err != nil {
-				return err
-			}
-			if c < 0 {
-				lo = lowerFloor
-			}
-		}
-		if currentGroupLower == nil {
-			v := *lo
-			currentGroupLower = &v
-		} else {
-			c, err := lo.Compare(sc.TypeCtx(), currentGroupLower, collate.GetBinaryCollator())
-			if err != nil {
-				return err
-			}
-			if c < 0 {
-				v := *lo
-				currentGroupLower = &v
-			}
-		}
-		if bucketLower == nil {
-			v := *lo
-			bucketLower = &v
-			return nil
-		}
-		c, err := lo.Compare(sc.TypeCtx(), bucketLower, collate.GetBinaryCollator())
-		if err != nil {
-			return err
-		}
-		if c < 0 {
-			v := *lo
-			bucketLower = &v
-		}
-		return nil
-	}
-
 	// consumeTopNRun advances ti past all entries sharing the next
 	// encoded key and returns (encoded, totalCount). Multiple
 	// partitions may contribute the same key; their counts are
@@ -2206,6 +2236,36 @@ func buildGlobalHistogram(
 			j++
 		}
 		return j, nil
+	}
+
+	// addPartContribs feeds the partition buckets in sortedRefs[ri:j]
+	// (all sharing the same upper key) into the in-progress group. When
+	// topNMatch is true, this group's upper is in the global TopN, so
+	// each bucket's Repeat is already counted there and is subtracted
+	// out; buckets whose count is fully Repeat contribute nothing and
+	// are skipped entirely (their lower bound is irrelevant).
+	addPartContribs := func(ri, j int, topNMatch bool) error {
+		for k := ri; k < j; k++ {
+			h := hists[sortedRefs[k].histIdx]
+			bkt := h.Buckets[sortedRefs[k].bucketIdx]
+			count := bkt.Count
+			if sortedRefs[k].bucketIdx > 0 {
+				count -= h.Buckets[sortedRefs[k].bucketIdx-1].Count
+			}
+			repeat := bkt.Repeat
+			if topNMatch {
+				count -= repeat
+				repeat = 0
+				if count <= 0 {
+					continue
+				}
+			}
+			fillLower(k)
+			if err := builder.addToGroup(&partBucketLower, count, repeat); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	ri := 0
@@ -2255,25 +2315,25 @@ func buildGlobalHistogram(
 			if _, inGlobal := globalTopNMap[hack.String(key)]; inGlobal || topNCount == 0 {
 				continue
 			}
-			startNewGroup(&topNDatum)
-			if err := addToGroup(&topNDatum, topNCount, topNCount); err != nil {
+			builder.startGroup(&topNDatum)
+			if err := builder.addToGroup(&topNDatum, topNCount, topNCount); err != nil {
 				return nil, err
 			}
-			if err := emitGroup(); err != nil {
+			if err := builder.emit(); err != nil {
 				return nil, err
 			}
 			continue
 		}
 
 		// hist-only (mergeOrd > 0) or merged (mergeOrd == 0) group.
-		startNewGroup(&startUpper)
+		builder.startGroup(&startUpper)
 
 		if mergeOrd == 0 {
 			// Same key on both streams, fold the leftover TopN count
 			// into the group.
 			key, topNCount := consumeTopNRun()
 			if _, inGlobal := globalTopNMap[hack.String(key)]; !inGlobal && topNCount > 0 {
-				if err := addToGroup(&topNDatum, topNCount, topNCount); err != nil {
+				if err := builder.addToGroup(&topNDatum, topNCount, topNCount); err != nil {
 					return nil, err
 				}
 			}
@@ -2287,45 +2347,16 @@ func buildGlobalHistogram(
 		if err != nil {
 			return nil, err
 		}
-
-		for k := ri; k < j; k++ {
-			h := hists[sortedRefs[k].histIdx]
-			bkt := h.Buckets[sortedRefs[k].bucketIdx]
-			count := bkt.Count
-			if sortedRefs[k].bucketIdx > 0 {
-				count -= h.Buckets[sortedRefs[k].bucketIdx-1].Count
-			}
-			repeat := bkt.Repeat
-			if topNMatch {
-				// This bucket's upper value is in the global TopN,
-				// so all partition histograms buckets repeat counts
-				// in this group is already in the global TopN count.
-				count -= repeat
-				repeat = 0
-				// count ≤ 0 means every row in this partition
-				// bucket was at the upper value, all of which TopN
-				// now owns. This bucket contributes no histogram
-				// mass to this group, so skip it, since this bucket
-				// is not needed, including its lower bound.
-				if count <= 0 {
-					continue
-				}
-			}
-			fillLower(k)
-			if err = addToGroup(&partBucketLower, count, repeat); err != nil {
-				return nil, err
-			}
+		if err := addPartContribs(ri, j, topNMatch); err != nil {
+			return nil, err
 		}
-
 		ri = j
-		if err = emitGroup(); err != nil {
+		if err := builder.emit(); err != nil {
 			return nil, err
 		}
 	}
 
-	if bucketLower != nil && lastUpper != nil {
-		globalHist.AppendBucketWithNDV(bucketLower, lastUpper, cumCount, lastRepeat, 0)
-	}
+	builder.flush()
 	// All AppendBucketWithNDV calls above pass 0, so bucket NDV is already 0
 	// for both index and column histograms.
 	statslogutil.StatsLogger().Info("buildGlobalHistogram: built global histogram",
