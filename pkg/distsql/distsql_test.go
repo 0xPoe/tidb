@@ -535,3 +535,9 @@ func createSelectNormal(t *testing.T, batch, totalRows int, planIDs []int, sctx 
 
 	return result, colTypes
 }
+
+func TestAnalyzeRequestSourceType(t *testing.T) {
+	require.Equal(t, kv.InternalTxnStats, analyzeRequestSourceType(context.Background()))
+	require.Equal(t, kv.InternalTxnStats, analyzeRequestSourceType(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers)))
+	require.Equal(t, kv.InternalTxnStatsProcessing, analyzeRequestSourceType(kv.WithInternalSourceType(context.Background(), kv.InternalTxnStatsProcessing)))
+}

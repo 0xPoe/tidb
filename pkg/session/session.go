@@ -2771,7 +2771,7 @@ func shouldBypass(ctx context.Context, stmtNode ast.StmtNode, sessVars *variable
 	case kv.InternalTxnOthers:
 		return true
 	// TODO: figure out what does this mean.
-	case kv.InternalTxnStats:
+	case kv.InternalTxnStats, kv.InternalTxnStatsProcessing:
 		return isNextGenForRUV2() && isAnalyzeStatementForRUV2(stmtNode, sessVars)
 	default:
 		return false

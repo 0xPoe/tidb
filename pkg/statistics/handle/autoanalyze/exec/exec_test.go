@@ -21,8 +21,10 @@ import (
 	"time"
 
 	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/statistics"
 	"github.com/pingcap/tidb/pkg/statistics/handle/autoanalyze/exec"
 	"github.com/pingcap/tidb/pkg/testkit"
@@ -149,6 +151,29 @@ partition by range (a) (
 		fmt.Sprintf("%d 2", legacyTableIDs[1]),
 		fmt.Sprintf("%d 2", legacyTableIDs[2]),
 	))
+}
+
+func TestRunAnalyzeStmtRequestSourceForAutoAnalyzeWindow(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (a int, b int, index idx(a))")
+	tk.MustExec("insert into t values (1, 1), (2, 2), (3, 3)")
+
+	sctx := tk.Session().(sessionctx.Context)
+	handle := dom.StatsHandle()
+	runAnalyzeAndCheckSource := func(expectedSource string) {
+		sctx.GetSessionVars().RequestSourceType = ""
+		_, _, err := exec.RunAnalyzeStmt(sctx, handle, dom.SysProcTracker(), statistics.Version2, false, "analyze table %n", "t")
+		require.NoError(t, err)
+		require.Equal(t, expectedSource, sctx.GetSessionVars().RequestSourceType)
+	}
+
+	runAnalyzeAndCheckSource(kv.InternalTxnStats)
+
+	tk.MustExec(fmt.Sprintf("set global %s='%s'", vardef.TiDBAutoAnalyzeStartTime, "01:00 +0000"))
+	tk.MustExec(fmt.Sprintf("set global %s='%s'", vardef.TiDBAutoAnalyzeEndTime, "02:00 +0000"))
+	runAnalyzeAndCheckSource(kv.InternalTxnStatsProcessing)
 }
 
 func TestKillInWindows(t *testing.T) {

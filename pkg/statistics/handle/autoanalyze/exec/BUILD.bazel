@@ -6,6 +6,7 @@ go_library(
     importpath = "github.com/pingcap/tidb/pkg/statistics/handle/autoanalyze/exec",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv",
         "//pkg/metrics",
         "//pkg/planner/core/resolve",
         "//pkg/sessionctx",
@@ -30,11 +31,13 @@ go_test(
     timeout = "short",
     srcs = ["exec_test.go"],
     flaky = True,
-    shard_count = 3,
+    shard_count = 4,
     deps = [
         ":exec",
+        "//pkg/kv",
         "//pkg/parser/ast",
         "//pkg/sessionctx",
+        "//pkg/sessionctx/vardef",
         "//pkg/statistics",
         "//pkg/testkit",
         "//pkg/util",

@@ -15,11 +15,13 @@
 package exec
 
 import (
+	"context"
 	"math"
 	"strconv"
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
 	"github.com/pingcap/tidb/pkg/sessionctx"
@@ -86,6 +88,29 @@ func AutoAnalyze(
 	return true
 }
 
+// autoAnalyzeRequestContext checks whether the auto-analyze window has been customized.
+// A customized window indicates that users expect ANALYZE to run during a low-load
+// period, so resource control should not throttle the analyze requests.
+func autoAnalyzeRequestContext(parameters map[string]string) context.Context {
+	sourceType := kv.InternalTxnStats
+	if !isDefaultAutoAnalyzeWindow(parameters) {
+		sourceType = kv.InternalTxnStatsProcessing
+	}
+	return kv.WithInternalSourceType(context.Background(), sourceType)
+}
+
+func isDefaultAutoAnalyzeWindow(parameters map[string]string) bool {
+	start := parameters[vardef.TiDBAutoAnalyzeStartTime]
+	if start == "" {
+		start = vardef.DefAutoAnalyzeStartTime
+	}
+	end := parameters[vardef.TiDBAutoAnalyzeEndTime]
+	if end == "" {
+		end = vardef.DefAutoAnalyzeEndTime
+	}
+	return start == vardef.DefAutoAnalyzeStartTime && end == vardef.DefAutoAnalyzeEndTime
+}
+
 // RunAnalyzeStmt executes the analyze statement.
 func RunAnalyzeStmt(
 	sctx sessionctx.Context,
@@ -113,7 +138,9 @@ func RunAnalyzeStmt(
 		}
 		statsHandle.ReleaseAutoAnalyzeProcID(autoAnalyzeProcID)
 	}()
-	return statsutil.ExecWithOpts(sctx, optFuncs, sql, params...)
+	analyzeParameters := GetAutoAnalyzeParameters(sctx)
+	ctx := autoAnalyzeRequestContext(analyzeParameters)
+	return statsutil.ExecWithCtxAndOpts(ctx, sctx, optFuncs, sql, params...)
 }
 
 // GetAutoAnalyzeParameters gets the auto analyze parameters from mysql.global_variables.

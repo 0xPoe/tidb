@@ -110,6 +110,7 @@ func TestRUV2SessionParserTotalDoesNotLeakAcrossStandaloneParse(t *testing.T) {
 
 	t.Run("statement bypass decision follows internal analyze semantics", func(t *testing.T) {
 		statsCtx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnStats)
+		statsProcessingCtx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnStatsProcessing)
 		origIsNextGenForRUV2 := isNextGenForRUV2
 		defer func() {
 			isNextGenForRUV2 = origIsNextGenForRUV2
@@ -128,11 +129,16 @@ func TestRUV2SessionParserTotalDoesNotLeakAcrossStandaloneParse(t *testing.T) {
 		isNextGenForRUV2 = func() bool { return true }
 		require.True(t, shouldBypass(statsCtx, &ast.AnalyzeTableStmt{}, se.sessionVars))
 		require.True(t, shouldBypass(statsCtx, execAnalyzeStmt, se.sessionVars))
+		require.True(t, shouldBypass(statsProcessingCtx, &ast.AnalyzeTableStmt{}, se.sessionVars))
+		require.True(t, shouldBypass(statsProcessingCtx, execAnalyzeStmt, se.sessionVars))
 
 		isNextGenForRUV2 = func() bool { return false }
 		require.False(t, shouldBypass(statsCtx, &ast.AnalyzeTableStmt{}, se.sessionVars))
 		require.False(t, shouldBypass(statsCtx, execAnalyzeStmt, se.sessionVars))
+		require.False(t, shouldBypass(statsProcessingCtx, &ast.AnalyzeTableStmt{}, se.sessionVars))
+		require.False(t, shouldBypass(statsProcessingCtx, execAnalyzeStmt, se.sessionVars))
 		require.False(t, shouldBypass(statsCtx, &ast.SelectStmt{}, se.sessionVars))
+		require.False(t, shouldBypass(statsProcessingCtx, &ast.SelectStmt{}, se.sessionVars))
 	})
 
 	t.Run("current-session restricted sql restores outer ruv2 metrics", func(t *testing.T) {

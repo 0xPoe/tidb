@@ -173,6 +173,19 @@ func SelectWithRuntimeStats(ctx context.Context, dctx *distsqlctx.DistSQLContext
 	return sr, nil
 }
 
+func analyzeRequestSourceType(ctx context.Context) string {
+	// Preserve InternalTxnStatsProcessing when the caller has explicitly marked
+	// this ANALYZE as internal stats processing, such as auto-analyze running in
+	// a customized auto-analyze window.
+	if kv.GetInternalSourceType(ctx) == kv.InternalTxnStatsProcessing {
+		return kv.InternalTxnStatsProcessing
+	}
+	// Treat all other ANALYZE requests as regular stats traffic so resource
+	// control can regulate them consistently.
+	// This is mainly for manual analyze as auto analyze would always set source type to one of stats sources.
+	return kv.InternalTxnStats
+}
+
 // Analyze do a analyze request.
 func Analyze(ctx context.Context, client kv.Client, kvReq *kv.Request, vars any,
 	isRestrict bool, dctx *distsqlctx.DistSQLContext) (SelectResult, error) {
@@ -188,7 +201,7 @@ func Analyze(ctx context.Context, client kv.Client, kvReq *kv.Request, vars any,
 		}
 	})
 	kvReq.RequestSource.RequestSourceInternal = true
-	kvReq.RequestSource.RequestSourceType = kv.InternalTxnStats
+	kvReq.RequestSource.RequestSourceType = analyzeRequestSourceType(ctx)
 	resp := client.Send(ctx, kvReq, vars, &kv.ClientSendOption{})
 	if resp == nil {
 		return nil, errors.New("client returns nil response")

@@ -274,8 +274,13 @@ func ExecRowsWithCtx(
 
 // ExecWithOpts is a helper function to execute sql and return rows and fields.
 func ExecWithOpts(sctx sessionctx.Context, opts []sqlexec.OptionFuncAlias, sql string, args ...any) (rows []chunk.Row, fields []*resolve.ResultField, err error) {
+	return ExecWithCtxAndOpts(StatsCtx, sctx, opts, sql, args...)
+}
+
+// ExecWithCtxAndOpts is a helper function to execute sql with the given context, options and return rows and fields.
+func ExecWithCtxAndOpts(ctx context.Context, sctx sessionctx.Context, opts []sqlexec.OptionFuncAlias, sql string, args ...any) (rows []chunk.Row, fields []*resolve.ResultField, err error) {
 	sqlExec := sctx.GetRestrictedSQLExecutor()
-	return sqlExec.ExecRestrictedSQL(StatsCtx, opts, sql, args...)
+	return sqlExec.ExecRestrictedSQL(ctx, opts, sql, args...)
 }
 
 // DurationToTS converts duration to timestamp.
