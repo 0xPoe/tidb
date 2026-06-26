@@ -44,6 +44,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/resourcegroup"
 	"github.com/pingcap/tidb/pkg/session/sessionapi"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -123,6 +124,8 @@ const (
 	tidbDDLTableVersion = "ddl_table_version"
 	// The variable name in mysql.tidb table and it records the cluster id of this cluster
 	tidbClusterID = "cluster_id"
+	// TODO: Decide whether this needs a default value and what that value should be.
+	defaultAnalyzeBackgroundUtilizationLimit = 30
 )
 
 // DDL owner key's expired time is ManagerSessionTTL seconds, we should wait the time and give more time to have a chance to finish it.
@@ -415,6 +418,10 @@ func doDDLWorks(s sessionapi.Session) {
 	mustExecute(s, metadef.CreateSchemaUnusedIndexesView)
 	// Create a test database.
 	mustExecute(s, "CREATE DATABASE IF NOT EXISTS test")
+	// TODO: Confirm with the PD team whether altering the default resource group during bootstrap is
+	// safe.
+	mustExecute(s, "ALTER RESOURCE GROUP %n BACKGROUND=(TASK_TYPES=%?, UTILIZATION_LIMIT=%?)",
+		resourcegroup.DefaultResourceGroupName, kv.InternalTxnStats, defaultAnalyzeBackgroundUtilizationLimit)
 }
 
 func checkSystemTableConstraint(tblInfo *model.TableInfo) error {
