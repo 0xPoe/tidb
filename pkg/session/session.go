@@ -2770,6 +2770,7 @@ func shouldBypass(ctx context.Context, stmtNode ast.StmtNode, sessVars *variable
 	switch kv.GetInternalSourceType(ctx) {
 	case kv.InternalTxnOthers:
 		return true
+	// TODO: figure out what does this mean.
 	case kv.InternalTxnStats:
 		return isNextGenForRUV2() && isAnalyzeStatementForRUV2(stmtNode, sessVars)
 	default:
