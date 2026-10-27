@@ -54,6 +54,7 @@ import (
 	"github.com/pingcap/tidb/pkg/domain/infosync"
 	"github.com/pingcap/tidb/pkg/domain/serverinfo"
 	"github.com/pingcap/tidb/pkg/domain/sqlsvrapi"
+	dxfautoanalyze "github.com/pingcap/tidb/pkg/dxf/autoanalyze"
 	"github.com/pingcap/tidb/pkg/dxf/framework/proto"
 	"github.com/pingcap/tidb/pkg/dxf/framework/scheduler"
 	"github.com/pingcap/tidb/pkg/dxf/framework/taskexecutor"
@@ -214,6 +215,10 @@ type session struct {
 	schemaValidator validatorapi.Validator
 	infoCache       *infoschema.InfoCache
 	store           kv.Storage
+
+	// crossKSSessPool is the session pool of the keyspace runtime that a cross
+	// keyspace session belongs to.
+	crossKSSessPool util.SessionPool
 
 	sessionPlanCache sessionctx.SessionPlanCache
 
@@ -1307,6 +1312,11 @@ func sqlForLog(sql string) string {
 }
 
 func (s *session) sysSessionPool() util.SessionPool {
+	if s.crossKSSessPool != nil {
+		// A cross keyspace session has no domain, its internal sessions come from
+		// the pool of the runtime of its keyspace.
+		return s.crossKSSessPool
+	}
 	return domain.GetDomain(s).SysSessionPool()
 }
 
@@ -1432,7 +1442,11 @@ func (s *session) GetGlobalSysVar(name string) (string, error) {
 		return "", variable.ErrUnknownSystemVar.GenWithStackByArgs(name)
 	}
 
-	sysVar, err := domain.GetDomain(s).GetGlobalVar(name)
+	dom := domain.GetDomain(s)
+	if dom == nil {
+		return s.getGlobalSysVarWithoutCache(sv)
+	}
+	sysVar, err := dom.GetGlobalVar(name)
 	if err != nil {
 		// The sysvar exists, but there is no cache entry yet.
 		// This might be because the sysvar was only recently registered.
@@ -1453,6 +1467,24 @@ func (s *session) GetGlobalSysVar(name string) (string, error) {
 		return sv.Value, nil
 	}
 	return sysVar, nil
+}
+
+// getGlobalSysVarWithoutCache reads the global variable from the table of the
+// keyspace. It is for a cross keyspace session, which has no domain and thus
+// no sysvar cache.
+func (s *session) getGlobalSysVarWithoutCache(sv *variable.SysVar) (string, error) {
+	val, err := s.getTableValue(context.TODO(), mysql.GlobalVariablesTable, sv.Name)
+	if errResultIsEmpty.Equal(err) {
+		return sv.Value, nil
+	}
+	if err != nil {
+		// A failed read must not look like a variable that was never set.
+		return "", err
+	}
+	if val, err = sv.ValidateFromType(s.GetSessionVars(), val, vardef.ScopeGlobal); err != nil {
+		return sv.Value, nil
+	}
+	return val, nil
 }
 
 // SetGlobalSysVar implements GlobalVarAccessor.SetGlobalSysVar interface.
@@ -2699,7 +2731,8 @@ func (s *session) executeStmtImpl(ctx context.Context, stmtNode ast.StmtNode) (r
 
 		memPriority := memory.ArbitrationPriorityMedium
 
-		if sg, ok := domain.GetDomain(s).InfoSchema().ResourceGroupByName(ast.NewCIStr(sessVars.StmtCtx.ResourceGroupName)); ok {
+		// A cross keyspace session has no domain, use its own info schema.
+		if sg, ok := s.infoCache.GetLatest().ResourceGroupByName(ast.NewCIStr(sessVars.StmtCtx.ResourceGroupName)); ok {
 			switch sg.Priority {
 			case ast.LowPriorityValue:
 				memPriority = memory.ArbitrationPriorityLow
@@ -4589,6 +4622,7 @@ func bootstrapSessionImpl(ctx context.Context, store kv.Storage, createSessionsI
 			return importinto.NewImportExecutor(ctx, task, param)
 		},
 	)
+	dxfautoanalyze.Register()
 
 	concurrency := config.GetGlobalConfig().Performance.StatsLoadConcurrency
 	if concurrency == 0 {
@@ -4962,9 +4996,18 @@ func createCrossKSSession(currKSStore kv.Storage, targetKS string, validator val
 	if err != nil {
 		return nil, err
 	}
+	sessPool, err := dom.GetKSSessPool(targetKS)
+	if err != nil {
+		return nil, err
+	}
 	// TODO: use the schema validator of the target keyspace when we implement
 	// the info schema syncer for cross keyspace access.
-	return createSessionWithOpt(store, nil, validator, infoCache, nil)
+	se, err := createSessionWithOpt(store, nil, validator, infoCache, nil)
+	if err != nil {
+		return nil, err
+	}
+	se.crossKSSessPool = sessPool
+	return se, nil
 }
 
 func createSessionWithOpt(
@@ -5576,7 +5619,7 @@ func (s *session) GetInfoSchema() infoschemactx.MetaOnlyInfoSchema {
 }
 
 func (s *session) GetLatestInfoSchema() infoschemactx.MetaOnlyInfoSchema {
-	is := s.infoCache.GetLatest()
+	is := s.infoCache.GetLatestWithOnDemandTables()
 	extIs := &infoschema.SessionExtendedInfoSchema{InfoSchema: is}
 	return temptable.AttachLocalTemporaryTableInfoSchema(s, extIs)
 }

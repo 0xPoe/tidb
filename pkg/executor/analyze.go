@@ -42,7 +42,6 @@ import (
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/sessiontxn"
 	"github.com/pingcap/tidb/pkg/statistics"
-	"github.com/pingcap/tidb/pkg/statistics/handle"
 	statslogutil "github.com/pingcap/tidb/pkg/statistics/handle/logutil"
 	statstypes "github.com/pingcap/tidb/pkg/statistics/handle/types"
 	handleutil "github.com/pingcap/tidb/pkg/statistics/handle/util"
@@ -105,6 +104,12 @@ func runningUnderGoTest() bool {
 // tasks will capture base count / modify_count from mysql.stats_meta. Without this, a stale
 // pre-analyze delta can be applied later and double count rows or modifications.
 func flushStatsDeltaForAnalyze(ctx context.Context, sctx sessionctx.Context, plan *core.Analyze) error {
+	if sctx.GetPlanCtx().IsCrossKS() {
+		// The broadcast goes to the TiDB servers of the keyspace of the current
+		// TiDB, not of the session. Whoever asks a node of another keyspace to
+		// analyze must flush the deltas on the nodes of the table's keyspace first.
+		return nil
+	}
 	flushObjects := collectStatsDeltaFlushObjectsForAnalyze(plan)
 	if len(flushObjects) == 0 {
 		return nil
@@ -308,7 +313,7 @@ func (e *AnalyzeExec) Next(ctx context.Context, _ *chunk.Chunk) (err error) {
 			metrics.ManualAnalyzeCounter.WithLabelValues("succ").Inc()
 		}
 	}()
-	statsHandle := domain.GetDomain(e.Ctx()).StatsHandle()
+	statsHandle := domain.GetAnalyzeStatsHandle(e.Ctx())
 	infoSchema := sessiontxn.GetTxnManager(e.Ctx()).GetTxnInfoSchema()
 	sessionVars := e.Ctx().GetSessionVars()
 	ctx, stop := e.buildAnalyzeKillCtx(ctx)
@@ -472,7 +477,7 @@ func (e *AnalyzeExec) waitFinish(ctx context.Context, g *errgroup.Group, results
 }
 
 // filterAndCollectTasks filters the tasks that are not locked and collects the table IDs.
-func filterAndCollectTasks(tasks []*analyzeTask, statsHandle *handle.Handle, is infoschema.InfoSchema) ([]*analyzeTask, uint, []string, error) {
+func filterAndCollectTasks(tasks []*analyzeTask, statsHandle statstypes.AnalyzeStatsHandle, is infoschema.InfoSchema) ([]*analyzeTask, uint, []string, error) {
 	var (
 		filteredTasks       []*analyzeTask
 		skippedTables       []string
@@ -536,7 +541,7 @@ func filterAndCollectTasks(tasks []*analyzeTask, statsHandle *handle.Handle, is 
 }
 
 // getLockedTableAndPartitionIDs queries the locked tables and partitions.
-func getLockedTableAndPartitionIDs(statsHandle *handle.Handle, tasks []*analyzeTask) (map[int64]struct{}, error) {
+func getLockedTableAndPartitionIDs(statsHandle statstypes.AnalyzeStatsHandle, tasks []*analyzeTask) (map[int64]struct{}, error) {
 	tidAndPids := make([]int64, 0, len(tasks))
 	// Check the locked tables in one transaction.
 	// We need to check all tables and its partitions.
@@ -634,8 +639,13 @@ func writeSavedAnalyzeOption(sql *strings.Builder, rawOpts map[ast.AnalyzeOption
 }
 
 func (e *AnalyzeExec) saveAnalyzeOptions() error {
-	if !vardef.PersistAnalyzeOptions.Load() || len(e.OptionsMap) == 0 {
+	if len(e.OptionsMap) == 0 {
 		return nil
+	}
+	persist, err := core.KeyspaceGlobalVar(
+		e.Ctx().GetPlanCtx(), vardef.TiDBPersistAnalyzeOptions, variable.BoolToOnOff(vardef.PersistAnalyzeOptions.Load()))
+	if err != nil || !variable.TiDBOptOn(persist) {
+		return err
 	}
 	// only to save table options if dynamic prune mode
 	dynamicPrune := variable.PartitionPruneMode(e.Ctx().GetSessionVars().PartitionPruneMode.Load()) == variable.Dynamic
@@ -682,7 +692,7 @@ func (e *AnalyzeExec) saveAnalyzeOptions() error {
 	}
 	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnDDL)
 	exec := e.Ctx().GetRestrictedSQLExecutor()
-	_, _, err := exec.ExecRestrictedSQL(ctx, nil, sql.String())
+	_, _, err = exec.ExecRestrictedSQL(ctx, nil, sql.String())
 	if err != nil {
 		return err
 	}
@@ -739,7 +749,7 @@ func resetAnalyzeOptionsForPartitions(ctx context.Context, exec sqlexec.Restrict
 }
 
 func recordHistoricalStats(sctx sessionctx.Context, tableID int64) error {
-	statsHandle := domain.GetDomain(sctx).StatsHandle()
+	statsHandle := domain.GetAnalyzeStatsHandle(sctx)
 	historicalStatsEnabled, err := statsHandle.CheckHistoricalStatsEnable()
 	if err != nil {
 		return errors.Errorf("check tidb_enable_historical_stats failed: %v", err)
@@ -747,7 +757,14 @@ func recordHistoricalStats(sctx sessionctx.Context, tableID int64) error {
 	if !historicalStatsEnabled {
 		return nil
 	}
-	historicalStatsWorker := domain.GetDomain(sctx).GetHistoricalStatsWorker()
+	dom := domain.GetDomain(sctx)
+	if dom == nil {
+		// A cross keyspace session has no domain and thus no worker to dump the
+		// historical stats in the background, so dump them here.
+		is := sctx.GetLatestInfoSchema().(infoschema.InfoSchema)
+		return domain.DumpHistoricalStatsWithInfoSchema(is, tableID, statsHandle)
+	}
+	historicalStatsWorker := dom.GetHistoricalStatsWorker()
 	historicalStatsWorker.SendTblToDumpHistoricalStats(tableID)
 	return nil
 }
@@ -795,7 +812,7 @@ func (e *AnalyzeExec) handleResultsErrorWithConcurrency(
 	globalStatsMap globalStatsMap,
 	resultsCh <-chan *statistics.AnalyzeResults,
 ) error {
-	statsHandle := domain.GetDomain(e.Ctx()).StatsHandle()
+	statsHandle := domain.GetAnalyzeStatsHandle(e.Ctx())
 	wg := util.NewWaitGroupPool(e.gp)
 	saveResultsCh := make(chan *statistics.AnalyzeResults, saveStatsConcurrency)
 	errCh := make(chan error, saveStatsConcurrency)
@@ -906,7 +923,7 @@ func analyzeWorkerExitErr(ctx context.Context, errExitCh <-chan struct{}) error 
 
 // trySendAnalyzeResult may drop and destroy result when the statement is already
 // aborting, so callers should not reuse result after calling it.
-func (e *AnalyzeExec) trySendAnalyzeResult(ctx context.Context, statsHandle *handle.Handle, resultsCh chan<- *statistics.AnalyzeResults, result *statistics.AnalyzeResults) {
+func (e *AnalyzeExec) trySendAnalyzeResult(ctx context.Context, statsHandle statstypes.AnalyzeStatsHandle, resultsCh chan<- *statistics.AnalyzeResults, result *statistics.AnalyzeResults) {
 	select {
 	case resultsCh <- result:
 		return
@@ -929,7 +946,7 @@ func (e *AnalyzeExec) trySendAnalyzeResult(ctx context.Context, statsHandle *han
 // ctx must be from AnalyzeExec.buildAnalyzeKillCtx
 func (e *AnalyzeExec) analyzeWorker(ctx context.Context, taskCh <-chan *analyzeTask, resultsCh chan<- *statistics.AnalyzeResults) {
 	var task *analyzeTask
-	statsHandle := domain.GetDomain(e.Ctx()).StatsHandle()
+	statsHandle := domain.GetAnalyzeStatsHandle(e.Ctx())
 	defer func() {
 		if r := recover(); r != nil {
 			statslogutil.StatsLogger().Warn("analyze worker panicked", zap.Any("recover", r), zap.Stack("stack"))
@@ -1000,14 +1017,14 @@ func AddNewAnalyzeJob(ctx sessionctx.Context, job *statistics.AnalyzeJob) {
 	} else {
 		instance = net.JoinHostPort(serverInfo.IP, strconv.Itoa(int(serverInfo.Port)))
 	}
-	statsHandle := domain.GetDomain(ctx).StatsHandle()
+	statsHandle := domain.GetAnalyzeStatsHandle(ctx)
 	err = statsHandle.InsertAnalyzeJob(job, instance, ctx.GetSessionVars().ConnectionID)
 	if err != nil {
 		statslogutil.StatsErrVerboseLogger().Error("failed to insert analyze job", zap.Error(err))
 	}
 }
 
-func finishJobWithLog(statsHandle *handle.Handle, job *statistics.AnalyzeJob, analyzeErr error) {
+func finishJobWithLog(statsHandle statstypes.AnalyzeStatsHandle, job *statistics.AnalyzeJob, analyzeErr error) {
 	statsHandle.FinishAnalyzeJob(job, analyzeErr, statistics.TableAnalysisJob)
 	if job != nil {
 		var state string

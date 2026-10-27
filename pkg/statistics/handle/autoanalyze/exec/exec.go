@@ -15,8 +15,10 @@
 package exec
 
 import (
+	"context"
 	"math"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
@@ -54,6 +56,34 @@ func execOptionForAnalyzeVersion(statsVer int, needVersionRewriteWarn bool, sql 
 	return sqlexec.ExecOptionAnalyzeVer2
 }
 
+// DistRequest is an auto-analyze statement that may run on another TiDB node.
+type DistRequest struct {
+	// SQL is the statement template, such as "analyze table %n.%n".
+	SQL string
+	// Params are the arguments of SQL.
+	Params []any
+	// NeedVersionRewriteWarn tells the node that runs the statement to log that
+	// it rewrites version 1 statistics.
+	NeedVersionRewriteWarn bool
+}
+
+// DistRunner runs an auto-analyze statement on some TiDB node and waits for its
+// result. sctx is an idle session of the current node, whose keyspace owns the
+// statement.
+type DistRunner func(
+	sctx sessionctx.Context,
+	statsHandle statstypes.StatsHandle,
+	sysProcTracker sysproctrack.Tracker,
+	req *DistRequest,
+) error
+
+var distRunner atomic.Pointer[DistRunner]
+
+// SetDistRunner sets the runner used when tidb_enable_dist_auto_analyze is ON.
+func SetDistRunner(r DistRunner) {
+	distRunner.Store(&r)
+}
+
 // AutoAnalyze executes the auto analyze task.
 func AutoAnalyze(
 	sctx sessionctx.Context,
@@ -65,7 +95,13 @@ func AutoAnalyze(
 	params ...any,
 ) bool {
 	startTime := time.Now()
-	_, _, err := RunAnalyzeStmt(sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
+	var err error
+	if r := distRunner.Load(); r != nil && vardef.EnableDistAutoAnalyze.Load() {
+		req := &DistRequest{SQL: sql, Params: params, NeedVersionRewriteWarn: needVersionRewriteWarn}
+		err = (*r)(sctx, statsHandle, sysProcTracker, req)
+	} else {
+		_, _, err = RunAnalyzeStmt(sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
+	}
 	dur := time.Since(startTime)
 	metrics.AutoAnalyzeHistogram.Observe(dur.Seconds())
 	if err != nil {
@@ -96,6 +132,27 @@ func RunAnalyzeStmt(
 	sql string,
 	params ...any,
 ) ([]chunk.Row, []*resolve.ResultField, error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logutil.BgLogger().Warn("panic in execAnalyzeStmt", zap.Any("error", r), zap.Stack("stack"))
+		}
+	}()
+	return RunAnalyzeStmtWithCtx(statsutil.StatsCtx, sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
+}
+
+// RunAnalyzeStmtWithCtx is RunAnalyzeStmt that stops when ctx, which must carry an
+// internal source type, is cancelled. It does not recover from a panic, so the caller
+// cannot take an unfinished statement as finished.
+func RunAnalyzeStmtWithCtx(
+	ctx context.Context,
+	sctx sessionctx.Context,
+	statsHandle statstypes.StatsHandle,
+	sysProcTracker sysproctrack.Tracker,
+	statsVer int,
+	needVersionRewriteWarn bool,
+	sql string,
+	params ...any,
+) ([]chunk.Row, []*resolve.ResultField, error) {
 	pruneMode := sctx.GetSessionVars().PartitionPruneMode.Load()
 	analyzeSnapshot := sctx.GetSessionVars().EnableAnalyzeSnapshot
 	autoAnalyzeTracker := statsutil.NewAutoAnalyzeTracker(sysProcTracker.Track, sysProcTracker.UnTrack)
@@ -107,13 +164,24 @@ func RunAnalyzeStmt(
 		sqlexec.ExecOptionUseCurSession,
 		sqlexec.ExecOptionWithSysProcTrack(autoAnalyzeProcID, autoAnalyzeTracker.Track, autoAnalyzeTracker.UnTrack),
 	}
+	// Some steps of an auto-analyze statement, like merging the global stats,
+	// only watch the SQL killer, so a cancellation of ctx is also delivered as a
+	// kill of the process. The session itself handles a cancellation that comes
+	// before the statement starts: it checks ctx after it has reset the killer.
+	killed := make(chan struct{})
+	stopKill := context.AfterFunc(ctx, func() {
+		defer close(killed)
+		sysProcTracker.KillSysProcess(autoAnalyzeProcID)
+	})
 	defer func() {
-		if r := recover(); r != nil {
-			logutil.BgLogger().Warn("panic in execAnalyzeStmt", zap.Any("error", r), zap.Stack("stack"))
+		// The kill must be over before the ID is released: a released ID can be
+		// given to another process.
+		if !stopKill() {
+			<-killed
 		}
 		statsHandle.ReleaseAutoAnalyzeProcID(autoAnalyzeProcID)
 	}()
-	return statsutil.ExecWithOpts(sctx, optFuncs, sql, params...)
+	return statsutil.ExecWithOptsWithCtx(ctx, sctx, optFuncs, sql, params...)
 }
 
 // GetAutoAnalyzeParameters gets the auto analyze parameters from mysql.global_variables.

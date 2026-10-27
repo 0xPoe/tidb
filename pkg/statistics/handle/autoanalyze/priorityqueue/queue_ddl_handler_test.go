@@ -54,6 +54,9 @@ func TestHandleDDLEventsWithRunningJobs(t *testing.T) {
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	enableAutoAnalyze(t, tk)
+	// The test holds a local analyze with mockStuckAnalyze while it adds an index.
+	// A DXF dispatch adds seconds, so the analyze would start after the index exists.
+	tk.MustExec("set global tidb_enable_dist_auto_analyze = OFF")
 	tk.MustExec("create table t1 (a int)")
 	statstestutil.HandleNextDDLEventWithTxn(handle)
 	tk.MustExec("insert into t1 values (1)")

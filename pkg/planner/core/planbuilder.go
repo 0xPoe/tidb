@@ -2323,8 +2323,7 @@ func (b *PlanBuilder) getPredicateColumns(tbl *resolve.TableNameW, cols *calcOnc
 	}
 	tblInfo := tbl.TableInfo
 	cols.data = make(map[int64]struct{}, len(tblInfo.Columns))
-	do := domain.GetDomain(b.ctx)
-	h := do.StatsHandle()
+	h := domain.GetAnalyzeStatsHandle(b.ctx)
 	colList, err := h.GetPredicateColumns(tblInfo.ID)
 	if err != nil {
 		return nil, err
@@ -2397,7 +2396,10 @@ func (b *PlanBuilder) getFullAnalyzeColumnsInfo(
 
 	switch columnChoice {
 	case ast.DefaultChoice:
-		columnOptions := vardef.AnalyzeColumnOptions.Load()
+		columnOptions, err := KeyspaceGlobalVar(b.ctx, vardef.TiDBAnalyzeColumnOptions, vardef.AnalyzeColumnOptions.Load())
+		if err != nil {
+			return nil, nil, err
+		}
 		switch columnOptions {
 		case ast.AllColumns.String():
 			return tbl.TableInfo.Columns, nil, nil
@@ -2728,7 +2730,11 @@ func (b *PlanBuilder) buildAnalyzeFullSamplingTask(
 		// Dynamic partition analyze later merges all partitions into table-level stats, so this
 		// rewrite decision must follow table-level/global stats compatibility rather than only the
 		// requested partition IDs.
-		tableVersionMatches := domain.GetDomain(b.ctx).StatsHandle().AnalyzeVersionMatchesForTable(tbl.TableInfo, version)
+		tableAndPartitionIDs := []int64{tbl.TableInfo.ID}
+		for _, def := range tbl.TableInfo.GetPartitionInfo().Definitions {
+			tableAndPartitionIDs = append(tableAndPartitionIDs, def.ID)
+		}
+		tableVersionMatches := b.analyzeVersionMatchesForPhysicalIDs(tbl.TableInfo, tableAndPartitionIDs, version)
 		if !tableVersionMatches {
 			// Reanalyze all partitions so the global merge rewrites table-level stats with the
 			// session-selected version.
@@ -2884,7 +2890,11 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 		maps.Copy(resetOpts, astResets)
 	}
 
-	tblFilledOpts := fillAnalyzeOptions(tblOpts)
+	optDefaults, err := analyzeOptionDefault(b.ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	tblFilledOpts := fillAnalyzeOptions(optDefaults, tblOpts)
 
 	tblColsInfo, tblColList, err := b.getFullAnalyzeColumnsInfo(tbl, tblColChoice, tblColList, predicateCols, mustAnalyzedCols, mustAllColumns, false)
 	if err != nil {
@@ -2943,7 +2953,7 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 			savedColChoice, savedColList := pickColumnList(parSavedColChoice, parSavedColList, tblSavedColChoice, tblSavedColList)
 			// then merge statement level options
 			mergedOpts := mergeAnalyzeOptions(astOpts, stmtResets, savedOpts)
-			filledMergedOpts := fillAnalyzeOptions(mergedOpts)
+			filledMergedOpts := fillAnalyzeOptions(optDefaults, mergedOpts)
 			finalColChoice, mergedColList := pickColumnList(astColChoice, astColList, savedColChoice, savedColList)
 			finalColsInfo, finalColList, err := b.getFullAnalyzeColumnsInfo(tbl, finalColChoice, mergedColList, predicateCols, mustAnalyzedCols, mustAllColumns, false)
 			if err != nil {
@@ -3061,7 +3071,7 @@ func pickColumnList(astColChoice ast.ColumnChoice, astColList []*model.ColumnInf
 }
 
 func (b *PlanBuilder) analyzeVersionMatchesForPhysicalIDs(tblInfo *model.TableInfo, physicalIDs []int64, requestedVersion int) bool {
-	statsHandle := domain.GetDomain(b.ctx).StatsHandle()
+	statsHandle := domain.GetAnalyzeStatsHandle(b.ctx)
 	intest.Assert(statsHandle != nil, "statsHandle should not be nil")
 	for _, physicalID := range physicalIDs {
 		if !statistics.AnalyzeVersionMatchesForTableStats(statsHandle.GetPhysicalTableStats(physicalID, tblInfo), requestedVersion) {
@@ -3081,7 +3091,12 @@ func (b *PlanBuilder) appendAnalyzeVersionOverwriteWarning() {
 func (b *PlanBuilder) buildAnalyzeTable(as *ast.AnalyzeTableStmt, opts map[ast.AnalyzeOptionType]uint64, version int) (base.Plan, error) {
 	p := Analyze{Opts: opts}.Init(b.ctx, b.getSelectOffset())
 	p.OptionsMap = make(map[int64]V2AnalyzeOptions)
-	usePersistedOptions := vardef.PersistAnalyzeOptions.Load()
+	persistOptions, err := KeyspaceGlobalVar(
+		b.ctx, vardef.TiDBPersistAnalyzeOptions, variable.BoolToOnOff(vardef.PersistAnalyzeOptions.Load()))
+	if err != nil {
+		return nil, err
+	}
+	usePersistedOptions := variable.TiDBOptOn(persistOptions)
 
 	// Construct tasks for each table.
 	for _, tbl := range as.TableNames {
@@ -3178,6 +3193,39 @@ var analyzeOptionLimit = map[ast.AnalyzeOptionType]uint64{
 	ast.AnalyzeOptNDVRate:       math.Float64bits(1),
 }
 
+// KeyspaceGlobalVar returns the GLOBAL value of a variable in the keyspace of the session.
+// processValue, the process level mirror, is only right outside a cross keyspace session.
+func KeyspaceGlobalVar(sctx base.PlanContext, name string, processValue string) (string, error) {
+	if !sctx.IsCrossKS() {
+		return processValue, nil
+	}
+	return sctx.GetSessionVars().GlobalVarsAccessor.GetGlobalSysVar(name)
+}
+
+// analyzeOptionDefault returns the default analyze options of the keyspace of
+// the session, see KeyspaceGlobalVar.
+func analyzeOptionDefault(sctx base.PlanContext) (map[ast.AnalyzeOptionType]uint64, error) {
+	defaults := AnalyzeOptionDefault()
+	if !sctx.IsCrossKS() {
+		return defaults, nil
+	}
+	for opt, name := range map[ast.AnalyzeOptionType]string{
+		ast.AnalyzeOptNumBuckets: vardef.TiDBAnalyzeDefaultNumBuckets,
+		ast.AnalyzeOptNumTopN:    vardef.TiDBAnalyzeDefaultNumTopN,
+	} {
+		val, err := sctx.GetSessionVars().GlobalVarsAccessor.GetGlobalSysVar(name)
+		if err != nil {
+			return nil, err
+		}
+		n, err := strconv.ParseUint(val, 10, 64)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		defaults[opt] = n
+	}
+	return defaults, nil
+}
+
 // AnalyzeOptionDefault returns the default analyze options.
 // TopN reduced from 500 to 100 due to concerns over large number of TopN values collected for customers with many tables.
 // 100 is more inline with other databases. 100-256 is also common for NumBuckets with other databases.
@@ -3272,8 +3320,7 @@ func handleAnalyzeOptions(opts []ast.AnalyzeOpt) (map[ast.AnalyzeOptionType]uint
 	return optMap, resetOpts, nil
 }
 
-func fillAnalyzeOptions(optMap map[ast.AnalyzeOptionType]uint64) map[ast.AnalyzeOptionType]uint64 {
-	defaults := AnalyzeOptionDefault()
+func fillAnalyzeOptions(defaults, optMap map[ast.AnalyzeOptionType]uint64) map[ast.AnalyzeOptionType]uint64 {
 	filledMap := make(map[ast.AnalyzeOptionType]uint64, len(defaults))
 	for key, defaultVal := range defaults {
 		if val, ok := optMap[key]; ok {
@@ -3309,7 +3356,11 @@ func (b *PlanBuilder) buildAnalyze(as *ast.AnalyzeTableStmt) (base.Plan, error) 
 	// saved options drops it and fillAnalyzeOptions supplies the default. When
 	// persistence is on, the per-table options built by
 	// buildAnalyzeFullSamplingTask take precedence over these in the executor.
-	filledOpts := fillAnalyzeOptions(mergeAnalyzeOptions(stmtOpts, stmtResets, nil))
+	optDefaults, err := analyzeOptionDefault(b.ctx)
+	if err != nil {
+		return nil, err
+	}
+	filledOpts := fillAnalyzeOptions(optDefaults, mergeAnalyzeOptions(stmtOpts, stmtResets, nil))
 
 	if as.IndexFlag {
 		if len(as.IndexNames) == 0 {

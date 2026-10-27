@@ -1,0 +1,35 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package autoanalyze
+
+import "github.com/pingcap/tidb/pkg/session/syssession"
+
+// WaitIdle exports waitIdle for test.
+func (p *statementPool) WaitIdle() {
+	p.waitIdle()
+}
+
+var (
+	// RunOnServiceNode exports runOnServiceNode for test.
+	RunOnServiceNode = runOnServiceNode
+	// NewStatementPool creates a statementPool for test.
+	NewStatementPool = func(p *syssession.AdvancedSessionPool) *statementPool {
+		return &statementPool{AdvancedSessionPool: p}
+	}
+	// AnalyzeConcurrency exports analyzeConcurrency for test.
+	AnalyzeConcurrency = analyzeConcurrency
+	// LimitAnalyzeConcurrency exports limitAnalyzeConcurrency for test.
+	LimitAnalyzeConcurrency = limitAnalyzeConcurrency
+)

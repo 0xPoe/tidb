@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/statistics/handle"
+	statstypes "github.com/pingcap/tidb/pkg/statistics/handle/types"
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"go.uber.org/zap"
 )
@@ -55,6 +56,13 @@ func (w *HistoricalStatsWorker) SendTblToDumpHistoricalStats(tableID int64) {
 
 // DumpHistoricalStats dump stats by given tableID
 func (w *HistoricalStatsWorker) DumpHistoricalStats(tableID int64, statsHandle *handle.Handle) error {
+	return DumpHistoricalStatsWithInfoSchema(GetDomain(w.sctx).InfoSchema(), tableID, statsHandle)
+}
+
+// DumpHistoricalStatsWithInfoSchema dumps the stats of the table, which is
+// looked up in is, if the historical stats are enabled. It serves the sessions
+// that have no domain and thus no HistoricalStatsWorker.
+func DumpHistoricalStatsWithInfoSchema(is infoschema.InfoSchema, tableID int64, statsHandle statstypes.AnalyzeStatsHandle) error {
 	historicalStatsEnabled, err := statsHandle.CheckHistoricalStatsEnable()
 	if err != nil {
 		return errors.Errorf("check tidb_enable_historical_stats failed: %v", err)
@@ -62,8 +70,6 @@ func (w *HistoricalStatsWorker) DumpHistoricalStats(tableID int64, statsHandle *
 	if !historicalStatsEnabled {
 		return nil
 	}
-	sctx := w.sctx
-	is := GetDomain(sctx).InfoSchema()
 	isPartition := false
 	var tblInfo *model.TableInfo
 	tbl, existed := is.TableByID(context.Background(), tableID)

@@ -36,6 +36,9 @@ func TestExecAutoAnalyzes(t *testing.T) {
 	store, dom := testkit.CreateMockStoreAndDomain(t)
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
+	// This test checks the local path of exec.AutoAnalyze. The DXF path has its
+	// own tests in pkg/dxf/autoanalyze.
+	tk.MustExec("set global tidb_enable_dist_auto_analyze = OFF")
 
 	tk.MustExec("create table t (a int, b int, index idx(a))")
 	tk.MustExec("insert into t values (1, 1), (2, 2), (3, 3)")
@@ -68,6 +71,9 @@ func TestExecAutoAnalyzeRewritesLegacyStatsVersionToV2(t *testing.T) {
 	store, dom := testkit.CreateMockStoreAndDomain(t)
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
+	// This test checks the version rewrite warning of the local path of
+	// exec.AutoAnalyze. The DXF path has its own tests in pkg/dxf/autoanalyze.
+	tk.MustExec("set global tidb_enable_dist_auto_analyze = OFF")
 
 	tk.MustExec("create table t (a int, b int, index idx(a))")
 	tk.MustExec("insert into t values (1, 1), (2, 2), (3, 3)")

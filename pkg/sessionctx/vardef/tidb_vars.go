@@ -1289,6 +1289,9 @@ const (
 	TiDBMaxAutoAnalyzeTime = "tidb_max_auto_analyze_time"
 	// TiDBAutoAnalyzeConcurrency is the concurrency of the auto analyze
 	TiDBAutoAnalyzeConcurrency = "tidb_auto_analyze_concurrency"
+	// TiDBEnableDistAutoAnalyze indicates whether the stats owner runs auto-analyze
+	// statements as DXF tasks, on any DXF node: itself, another TiDB, or a service node.
+	TiDBEnableDistAutoAnalyze = "tidb_enable_dist_auto_analyze"
 	// TiDBEnableDistTask indicates whether to enable the distributed execute background tasks(For example DDL, Import etc).
 	TiDBEnableDistTask = "tidb_enable_dist_task"
 	// TiDBMaxDistTaskNodes indicates the max node count that could be used by distributed execution framework.
@@ -1804,6 +1807,7 @@ const (
 	DefTiDBMemOOMAction                               = "CANCEL"
 	DefTiDBMaxAutoAnalyzeTime                         = 12 * 60 * 60
 	DefTiDBAutoAnalyzeConcurrency                     = 3
+	DefTiDBEnableDistAutoAnalyze                      = true
 	DefTiDBEnablePrepPlanCache                        = true
 	DefTiDBPrepPlanCacheSize                          = 100
 	DefTiDBSessionPlanCacheSize                       = 100
@@ -2063,6 +2067,7 @@ var (
 	enableMDL                           = atomic.NewBool(false)
 	AutoAnalyzePartitionBatchSize       = atomic.NewInt64(DefTiDBAutoAnalyzePartitionBatchSize)
 	AutoAnalyzeConcurrency              = atomic.NewInt32(DefTiDBAutoAnalyzeConcurrency)
+	EnableDistAutoAnalyze               = atomic.NewBool(DefTiDBEnableDistAutoAnalyze)
 	// TODO: set value by session variable
 	EnableWorkloadBasedLearning   = atomic.NewBool(DefTiDBEnableWorkloadBasedLearning)
 	WorkloadBasedLearningInterval = atomic.NewDuration(DefTiDBWorkloadBasedLearningInterval)

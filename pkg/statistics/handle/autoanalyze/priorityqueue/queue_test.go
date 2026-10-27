@@ -183,6 +183,9 @@ func testProcessDMLChanges(t *testing.T, partitioned bool) {
 	store, dom := testkit.CreateMockStoreAndDomain(t)
 	handle := dom.StatsHandle()
 	tk := testkit.NewTestKit(t, store)
+	// The job weights include the time since the last analyze, so the test needs a
+	// fast local analyze. A DXF dispatch adds seconds between the two analyzes.
+	tk.MustExec("set global tidb_enable_dist_auto_analyze = OFF")
 	ctx := context.Background()
 	if partitioned {
 		tk.MustExec("use test")
