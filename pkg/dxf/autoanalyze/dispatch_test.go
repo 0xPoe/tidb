@@ -21,6 +21,7 @@ import (
 
 	"github.com/pingcap/tidb/pkg/dxf/autoanalyze"
 	"github.com/pingcap/tidb/pkg/dxf/framework/proto"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/session/syssession"
 	"github.com/pingcap/tidb/pkg/sessionctx"
@@ -170,6 +171,9 @@ func TestStatementPoolWaitsForUsers(t *testing.T) {
 }
 
 func TestLimitAnalyzeConcurrency(t *testing.T) {
+	// The slots of a statement are capped at the CPU count of a node. With 16
+	// CPUs, that cap is above all the slots checked below.
+	testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/util/cpu/mockNumCpu", "return(16)")
 	store, dom := testkit.CreateMockStoreAndDomain(t)
 	tk := testkit.NewTestKit(t, store)
 	ctx := context.Background()
@@ -206,11 +210,41 @@ func TestLimitAnalyzeConcurrency(t *testing.T) {
 			restore()
 			require.Equal(t, []string{"6", "3", "2"}, settings())
 		}
-
-		// The statement asks for the build concurrency as its slots.
-		slots, err := autoanalyze.AnalyzeConcurrency(ctx, sctx)
-		require.NoError(t, err)
-		require.Equal(t, 6, slots)
 		return nil
 	}))
+
+	// The statement asks for the tables or partitions it analyzes at once as its
+	// slots. These are the statement forms of the priority queue.
+	dxfCtx := kv.WithInternalSourceType(ctx, kv.InternalDistTask)
+	for _, c := range []struct {
+		sql    string
+		params []string
+		slots  int
+	}{
+		{"analyze table %n.%n", []string{"test", "t"}, 1},
+		{"analyze table %n.%n index %n", []string{"test", "t", "idx"}, 1},
+		{"analyze table %n.%n partition %n", []string{"test", "t", "p0"}, 1},
+		{"analyze table %n.%n partition %n index %n", []string{"test", "t", "p0", "idx"}, 1},
+		{"analyze table %n.%n partition %n, %n, %n", []string{"test", "t", "p0", "p1", "p2"}, 3},
+		{"analyze table %n.%n partition %n, %n, %n index %n", []string{"test", "t", "p0", "p1", "p2", "idx"}, 3},
+		// The build concurrency caps the partitions analyzed at once.
+		{"analyze table %n.%n partition %n, %n, %n, %n, %n, %n, %n, %n",
+			[]string{"test", "t", "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"}, 6},
+	} {
+		slots, err := autoanalyze.RequiredSlots(dxfCtx, tk.Session(), &autoanalyze.TaskMeta{SQL: c.sql, Params: c.params})
+		require.NoError(t, err)
+		require.Equal(t, c.slots, slots, c.sql)
+	}
+
+	// The statement goes to the node with the fewest used slots. With equal used
+	// slots, tasks with consecutive IDs start at consecutive nodes in host order.
+	nodes := []string{"a", "b", "c"}
+	require.Equal(t, []string{"a", "b", "c"}, autoanalyze.OrderByUsedSlots(nodes, nil, 3))
+	require.Equal(t, []string{"b", "c", "a"}, autoanalyze.OrderByUsedSlots(nodes, nil, 4))
+	// Only the nodes with equal used slots rotate. A node without subtasks has
+	// none, and the used slots of other nodes do not matter.
+	nodes = []string{"a", "b", "c", "d"}
+	usedSlots := map[string]int{"a": 3, "c": 5, "d": 0, "other-scope": 1}
+	require.Equal(t, []string{"b", "d", "a", "c"}, autoanalyze.OrderByUsedSlots(nodes, usedSlots, 4))
+	require.Equal(t, []string{"d", "b", "a", "c"}, autoanalyze.OrderByUsedSlots(nodes, usedSlots, 7))
 }

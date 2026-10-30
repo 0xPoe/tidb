@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,7 +116,7 @@ func dispatch(
 			return errors.Annotate(err, "flush stats delta before dispatching auto analyze")
 		}
 	}
-	slots, err := requiredSlots(ctx, sctx)
+	slots, err := requiredSlots(ctx, sctx, taskMeta)
 	if err != nil {
 		return err
 	}
@@ -216,9 +217,9 @@ func newTaskMeta(sctx sessionctx.Context, req *exec.DistRequest) (*TaskMeta, err
 }
 
 // requiredSlots returns the tables or partitions the statement analyzes at
-// once, capped at one node. The scan and the sampling of ANALYZE run in TiKV
-// and are most of its work, so the slots do not count them.
-func requiredSlots(ctx context.Context, sctx sessionctx.Context) (int, error) {
+// once, capped at one node: a worker of ANALYZE builds one of them at a time.
+// The scan and the sampling, most of its work, run in TiKV and take no slots.
+func requiredSlots(ctx context.Context, sctx sessionctx.Context, meta *TaskMeta) (int, error) {
 	concurrency, err := analyzeConcurrency(ctx, sctx)
 	if err != nil {
 		return 0, err
@@ -227,7 +228,17 @@ func requiredSlots(ctx context.Context, sctx sessionctx.Context) (int, error) {
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
-	return min(concurrency, nodeCPU), nil
+	return min(concurrency, analyzeUnits(meta), nodeCPU), nil
+}
+
+// analyzeUnits returns the tables or partitions the statement analyzes. Its
+// parameters are the schema, the table, any partitions, and any index.
+func analyzeUnits(meta *TaskMeta) int {
+	units := len(meta.Params) - 2
+	if strings.Contains(meta.SQL, " index ") {
+		units--
+	}
+	return max(units, 1)
 }
 
 // analyzeConcurrency returns tidb_auto_build_stats_concurrency of the session:

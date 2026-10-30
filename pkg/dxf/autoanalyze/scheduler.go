@@ -15,12 +15,15 @@
 package autoanalyze
 
 import (
+	"cmp"
 	"context"
+	"slices"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/dxf/framework/proto"
 	"github.com/pingcap/tidb/pkg/dxf/framework/scheduler"
 	"github.com/pingcap/tidb/pkg/dxf/framework/storage"
+	"go.uber.org/zap"
 )
 
 type schedulerImpl struct {
@@ -53,10 +56,46 @@ func (*schedulerImpl) OnDone(context.Context, storage.TaskHandle, *proto.Task) e
 	return nil
 }
 
-// GetEligibleInstances returns nil: the statement can run on every node of the
-// target scope, and the framework places it by the slots it requires.
-func (*schedulerImpl) GetEligibleInstances(context.Context, *proto.Task) ([]string, error) {
-	return nil, nil
+// GetEligibleInstances returns the nodes of the target scope, fewest used slots
+// first. The framework runs a task of max node count 1 on the first node only,
+// so the statement goes to the least busy node; nil falls back to host order.
+func (s *schedulerImpl) GetEligibleInstances(ctx context.Context, task *proto.Task) ([]string, error) {
+	nodes := s.GetNodesInScope()
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	usedSlots, err := s.GetTaskMgr().GetUsedSlotsOnNodes(ctx)
+	if err != nil {
+		s.GetLogger().Warn("get used slots on nodes failed, place auto analyze task by host order", zap.Error(err))
+		return nil, nil
+	}
+	return orderByUsedSlots(nodes, usedSlots, task.ID), nil
+}
+
+// orderByUsedSlots returns the nodes sorted by used slots, ascending. Nodes with
+// equal used slots rotate from their given order by the task ID: tasks started
+// together read the same used slots, and would all take the same node otherwise.
+func orderByUsedSlots(nodes []string, usedSlots map[string]int, taskID int64) []string {
+	n := len(nodes)
+	if n == 0 {
+		return nil
+	}
+	shift := int(taskID % int64(n))
+	positions := make([]int, n)
+	for i := range positions {
+		positions[i] = i
+	}
+	slices.SortFunc(positions, func(a, b int) int {
+		return cmp.Or(
+			cmp.Compare(usedSlots[nodes[a]], usedSlots[nodes[b]]),
+			cmp.Compare((a-shift+n)%n, (b-shift+n)%n),
+		)
+	})
+	ordered := make([]string, 0, n)
+	for _, i := range positions {
+		ordered = append(ordered, nodes[i])
+	}
+	return ordered
 }
 
 // IsRetryableErr returns false: the priority queue of the stats owner analyzes

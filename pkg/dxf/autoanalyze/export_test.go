@@ -28,8 +28,10 @@ var (
 	NewStatementPool = func(p *syssession.AdvancedSessionPool) *statementPool {
 		return &statementPool{AdvancedSessionPool: p}
 	}
-	// AnalyzeConcurrency exports analyzeConcurrency for test.
-	AnalyzeConcurrency = analyzeConcurrency
+	// RequiredSlots exports requiredSlots for test.
+	RequiredSlots = requiredSlots
 	// LimitAnalyzeConcurrency exports limitAnalyzeConcurrency for test.
 	LimitAnalyzeConcurrency = limitAnalyzeConcurrency
+	// OrderByUsedSlots exports orderByUsedSlots for test.
+	OrderByUsedSlots = orderByUsedSlots
 )
