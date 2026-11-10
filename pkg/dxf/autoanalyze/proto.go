@@ -17,6 +17,11 @@
 // and each statement runs on a DXF node of the target scope.
 package autoanalyze
 
+import (
+	"encoding/json"
+	"slices"
+)
+
 // TaskMeta is the meta of both the task and its single subtask.
 type TaskMeta struct {
 	// SQL is the analyze statement template, such as "analyze table %n.%n".
@@ -36,4 +41,11 @@ func (m *TaskMeta) args() []any {
 		args = append(args, p)
 	}
 	return args
+}
+
+// sameStatement reports whether meta, the meta of another task, holds the
+// statement of m. A meta that does not decode is taken as another statement.
+func (m *TaskMeta) sameStatement(meta []byte) bool {
+	other := &TaskMeta{}
+	return json.Unmarshal(meta, other) == nil && m.SQL == other.SQL && slices.Equal(m.Params, other.Params)
 }

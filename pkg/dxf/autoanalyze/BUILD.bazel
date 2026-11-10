@@ -33,6 +33,7 @@ go_library(
         "//pkg/util/logutil",
         "@com_github_google_uuid//:uuid",
         "@com_github_pingcap_errors//:errors",
+        "@com_github_pingcap_failpoint//:failpoint",
         "@org_uber_go_zap//:zap",
     ],
 )
@@ -49,6 +50,8 @@ go_test(
     deps = [
         "//pkg/config/kerneltype",
         "//pkg/dxf/framework/handle",
+        "//pkg/dxf/framework/proto",
+        "//pkg/kv",
         "//pkg/parser/ast",
         "//pkg/sessionctx",
         "//pkg/sessionctx/vardef",
@@ -56,6 +59,7 @@ go_test(
         "//pkg/statistics/handle/autoanalyze/exec",
         "//pkg/statistics/handle/ddl/testutil",
         "//pkg/testkit",
+        "//pkg/testkit/testfailpoint",
         "@com_github_stretchr_testify//require",
     ],
 )
