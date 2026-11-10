@@ -93,13 +93,23 @@ func TestAutoAnalyzeThroughDXF(t *testing.T) {
 	defer func() {
 		statistics.AutoAnalyzeMinCnt = 1000
 	}()
+	// The scheduler has placed the task when it is about to create the subtask.
+	const beforeSubtask = "github.com/pingcap/tidb/pkg/dxf/framework/scheduler/cancelBeforeUpdateTask"
+	var placedBeforeSubtask atomic.Int64
+	testfailpoint.EnableCall(t, beforeSubtask, func(int64) {
+		placedBeforeSubtask.Store(int64(autoanalyze.PlacedTasks()))
+	})
 
 	setRowCount(tblInfo.ID, autoanalyze.DistMinRowCount)
 	require.True(t, h.HandleAutoAnalyze())
+	testfailpoint.Disable(t, beforeSubtask)
 
 	// The statement went through DXF and succeeded there, with one slot and
 	// outside the scope of the stats owner.
 	tk.MustQuery(allTasks).Check(testkit.Rows(succeededTask))
+	// The scheduler held a place for the task, and has released it.
+	require.EqualValues(t, 1, placedBeforeSubtask.Load())
+	require.Zero(t, autoanalyze.PlacedTasks())
 	// It is still recorded as an auto analyze job, and the stats are there.
 	tk.MustQuery(finishedJobs).Check(testkit.Rows("1"))
 	require.NoError(t, h.Update(ctx, dom.InfoSchema()))
@@ -202,6 +212,39 @@ func TestAutoAnalyzeThroughDXF(t *testing.T) {
 		tk.MustQuery(allTasks).Check(testkit.Rows(slices.Repeat([]string{succeededTask}, len(rows))...))
 		require.Equal(t, int64(3), h.GetPhysicalTableStats(tblInfo.ID, tblInfo).RealtimeCount)
 	}
+
+	// The schedulers have released the places of all these tasks.
+	require.Zero(t, autoanalyze.PlacedTasks())
+	// Tasks that are placed against the same used slots count the places of each
+	// other, and spread over the nodes. Without that they would all go to b.
+	nodes := []string{"a", "b"}
+	usedSlots := map[string]int{"a": 1}
+	firstNodes := make([]string, 0, 4)
+	for taskID := int64(1); taskID <= 4; taskID++ {
+		firstNodes = append(firstNodes, autoanalyze.PlaceTask(taskID, nodes, usedSlots)[0])
+	}
+	require.Equal(t, []string{"b", "a", "b", "a"}, firstNodes)
+	// A task that is placed again does not count its own place.
+	require.Equal(t, []string{"a", "b"}, autoanalyze.PlaceTask(4, nodes, usedSlots))
+	// A released place no longer counts.
+	for taskID := int64(1); taskID <= 4; taskID++ {
+		autoanalyze.ReleaseTask(taskID)
+	}
+	require.Zero(t, autoanalyze.PlacedTasks())
+	require.Equal(t, []string{"b", "a"}, autoanalyze.PlaceTask(5, nodes, usedSlots))
+	autoanalyze.ReleaseTask(5)
+
+	// The statement goes to the node with the fewest used slots. With equal used
+	// slots, tasks with consecutive IDs start at consecutive nodes in host order.
+	nodes = []string{"a", "b", "c"}
+	require.Equal(t, []string{"a", "b", "c"}, autoanalyze.OrderByUsedSlots(nodes, nil, 3))
+	require.Equal(t, []string{"b", "c", "a"}, autoanalyze.OrderByUsedSlots(nodes, nil, 4))
+	// Only the nodes with equal used slots rotate. A node without subtasks has
+	// none, and the used slots of other nodes do not matter.
+	nodes = []string{"a", "b", "c", "d"}
+	usedSlots = map[string]int{"a": 3, "c": 5, "d": 0, "other-scope": 1}
+	require.Equal(t, []string{"b", "d", "a", "c"}, autoanalyze.OrderByUsedSlots(nodes, usedSlots, 4))
+	require.Equal(t, []string{"d", "b", "a", "c"}, autoanalyze.OrderByUsedSlots(nodes, usedSlots, 7))
 }
 
 // TestKillDispatchedAutoAnalyze kills the auto-analyze process of the stats

@@ -14,7 +14,7 @@
 
 // Package autoanalyze runs the auto-analyze statements of big tables as DXF
 // tasks: the stats owner keeps the priority queue and the concurrency control,
-// and each statement runs on a DXF node of the target scope.
+// and each statement runs on the least used DXF node of the target scope.
 package autoanalyze
 
 import (
