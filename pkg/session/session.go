@@ -1442,7 +1442,11 @@ func (s *session) GetGlobalSysVar(name string) (string, error) {
 		return "", variable.ErrUnknownSystemVar.GenWithStackByArgs(name)
 	}
 
-	sysVar, err := domain.GetDomain(s).GetGlobalVar(name)
+	dom := domain.GetDomain(s)
+	if dom == nil {
+		return s.getGlobalSysVarWithoutCache(sv)
+	}
+	sysVar, err := dom.GetGlobalVar(name)
 	if err != nil {
 		// The sysvar exists, but there is no cache entry yet.
 		// This might be because the sysvar was only recently registered.
@@ -1463,6 +1467,24 @@ func (s *session) GetGlobalSysVar(name string) (string, error) {
 		return sv.Value, nil
 	}
 	return sysVar, nil
+}
+
+// getGlobalSysVarWithoutCache reads the global variable from the table of the
+// keyspace. It is for a cross keyspace session, which has no domain and thus
+// no sysvar cache.
+func (s *session) getGlobalSysVarWithoutCache(sv *variable.SysVar) (string, error) {
+	val, err := s.getTableValue(context.TODO(), mysql.GlobalVariablesTable, sv.Name)
+	if errResultIsEmpty.Equal(err) {
+		return sv.Value, nil
+	}
+	if err != nil {
+		// A failed read must not look like a variable that was never set.
+		return "", err
+	}
+	if val, err = sv.ValidateFromType(s.GetSessionVars(), val, vardef.ScopeGlobal); err != nil {
+		return sv.Value, nil
+	}
+	return val, nil
 }
 
 // SetGlobalSysVar implements GlobalVarAccessor.SetGlobalSysVar interface.
