@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package autoanalyze runs auto-analyze statements as DXF tasks: the stats
-// owner keeps the priority queue and the concurrency control, and each
-// statement runs on a DXF node of the target scope.
+// Package autoanalyze runs the auto-analyze statements of big tables as DXF
+// tasks: the stats owner keeps the priority queue and the concurrency control,
+// and each statement runs on a DXF node of the target scope.
 package autoanalyze
 
 // TaskMeta is the meta of both the task and its single subtask.

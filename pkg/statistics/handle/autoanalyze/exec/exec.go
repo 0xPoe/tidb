@@ -69,13 +69,13 @@ type DistRequest struct {
 
 // DistRunner runs an auto-analyze statement on some TiDB node and waits for its
 // result. sctx is an idle session of the current node, whose keyspace owns the
-// statement.
+// statement. It returns false, with sctx unchanged, to leave the statement here.
 type DistRunner func(
 	sctx sessionctx.Context,
 	statsHandle statstypes.StatsHandle,
 	sysProcTracker sysproctrack.Tracker,
 	req *DistRequest,
-) error
+) (taken bool, err error)
 
 var distRunner atomic.Pointer[DistRunner]
 
@@ -95,11 +95,15 @@ func AutoAnalyze(
 	params ...any,
 ) bool {
 	startTime := time.Now()
-	var err error
+	var (
+		taken bool
+		err   error
+	)
 	if r := distRunner.Load(); r != nil && vardef.EnableDistAutoAnalyze.Load() {
 		req := &DistRequest{SQL: sql, Params: params, NeedVersionRewriteWarn: needVersionRewriteWarn}
-		err = (*r)(sctx, statsHandle, sysProcTracker, req)
-	} else {
+		taken, err = (*r)(sctx, statsHandle, sysProcTracker, req)
+	}
+	if !taken {
 		_, _, err = RunAnalyzeStmt(sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
 	}
 	dur := time.Since(startTime)

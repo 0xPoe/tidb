@@ -20,10 +20,13 @@ import (
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/dxf/autoanalyze"
 	"github.com/pingcap/tidb/pkg/dxf/framework/handle"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/statistics"
+	"github.com/pingcap/tidb/pkg/statistics/handle/autoanalyze/exec"
 	statstestutil "github.com/pingcap/tidb/pkg/statistics/handle/ddl/testutil"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
@@ -49,10 +52,29 @@ func TestAutoAnalyzeThroughDXF(t *testing.T) {
 	h := dom.StatsHandle()
 	require.NoError(t, statstestutil.HandleNextDDLEventWithTxn(h))
 	tk.MustExec("flush stats_delta *.*")
-	require.NoError(t, h.Update(ctx, dom.InfoSchema()))
 	tbl, err := dom.InfoSchema().TableByName(ctx, ast.NewCIStr("test"), ast.NewCIStr("t"))
 	require.NoError(t, err)
 	tblInfo := tbl.Meta()
+	// setRowCount makes the stats owner see the table or partition with this
+	// number of rows. Its next analysis sets the count back to the real one.
+	setRowCount := func(physicalID, count int64) {
+		version := tk.MustQuery("select max(version) + 1 from mysql.stats_meta").Rows()[0][0]
+		tk.MustExec("update mysql.stats_meta set count = ?, version = ? where table_id = ?", count, version, physicalID)
+		require.NoError(t, h.Update(ctx, dom.InfoSchema()))
+		tblStats, ok := h.GetNonPseudoPhysicalTableStats(physicalID)
+		require.True(t, ok)
+		require.Equal(t, count, tblStats.RealtimeCount)
+	}
+	// autoAnalyze runs the statement the way the priority queue does, but
+	// without its panic recovery: a panic must fail the test.
+	autoAnalyze := func(sql string, params ...any) bool {
+		var ok bool
+		require.NoError(t, autoanalyze.WithStatsSession(h.SPool(), func(sctx sessionctx.Context) error {
+			ok = exec.AutoAnalyze(sctx, h, dom.SysProcTracker(), statistics.Version2, false, sql, params...)
+			return nil
+		}))
+		return ok
+	}
 	const allTasks = "select type, state, concurrency, target_scope from mysql.tidb_global_task union all " +
 		"select type, state, concurrency, target_scope from mysql.tidb_global_task_history"
 	const finishedJobs = "select count(*) from mysql.analyze_jobs " +
@@ -63,6 +85,7 @@ func TestAutoAnalyzeThroughDXF(t *testing.T) {
 		statistics.AutoAnalyzeMinCnt = 1000
 	}()
 
+	setRowCount(tblInfo.ID, autoanalyze.DistMinRowCount)
 	require.True(t, h.HandleAutoAnalyze())
 
 	// The statement went through DXF and succeeded there, with one slot and
@@ -73,4 +96,46 @@ func TestAutoAnalyzeThroughDXF(t *testing.T) {
 	require.NoError(t, h.Update(ctx, dom.InfoSchema()))
 	require.Equal(t, int64(3), h.GetPhysicalTableStats(tblInfo.ID, tblInfo).RealtimeCount)
 	require.True(t, h.GetPhysicalTableStats(tblInfo.ID, tblInfo).IsAnalyzed())
+
+	// Below the row limit the statement runs on the stats owner. So does the
+	// statement of a table whose stats this node does not know, whatever row
+	// count the storage has for it. Neither submits a task.
+	setRowCount(tblInfo.ID, autoanalyze.DistMinRowCount-1)
+	require.True(t, autoAnalyze("analyze table %n.%n", "test", "t"))
+	setRowCount(tblInfo.ID, autoanalyze.DistMinRowCount)
+	h.Clear()
+	require.True(t, h.GetPhysicalTableStats(tblInfo.ID, tblInfo).Pseudo)
+	require.True(t, autoAnalyze("analyze table %n.%n", "test", "t"))
+	tk.MustQuery(allTasks).Check(testkit.Rows(succeededTask))
+	tk.MustQuery(finishedJobs).Check(testkit.Rows("3"))
+	// A statement that a task cannot describe, here one without the schema, also
+	// runs on the stats owner, although its table has enough rows.
+	setRowCount(tblInfo.ID, autoanalyze.DistMinRowCount)
+	require.True(t, exec.AutoAnalyze(tk.Session(), h, dom.SysProcTracker(), statistics.Version2, false, "analyze table %n", "t"))
+	tk.MustQuery(allTasks).Check(testkit.Rows(succeededTask))
+	tk.MustQuery(finishedJobs).Check(testkit.Rows("4"))
+
+	// The rows of a partitioned table are those of its partitions, whatever its
+	// table-level count is.
+	tk.MustExec("create table pt (a int, b int, index idx(a)) partition by range (a) " +
+		"(partition p0 values less than (2), partition p1 values less than (10))")
+	tk.MustExec("insert into pt values (1, 1), (2, 2), (3, 3)")
+	require.NoError(t, statstestutil.HandleNextDDLEventWithTxn(h))
+	tk.MustExec("flush stats_delta *.*")
+	pt, err := dom.InfoSchema().TableByName(ctx, ast.NewCIStr("test"), ast.NewCIStr("pt"))
+	require.NoError(t, err)
+	partitions := pt.Meta().GetPartitionInfo().Definitions
+	analyzePartitions := func() bool {
+		return autoAnalyze("analyze table %n.%n partition %n, %n", "test", "pt", "p0", "p1")
+	}
+	setRowCount(pt.Meta().ID, autoanalyze.DistMinRowCount)
+	setRowCount(partitions[0].ID, autoanalyze.DistMinRowCount-1)
+	setRowCount(partitions[1].ID, 0)
+	require.True(t, analyzePartitions())
+	tk.MustQuery(allTasks).Check(testkit.Rows(succeededTask))
+	setRowCount(pt.Meta().ID, autoanalyze.DistMinRowCount-1)
+	setRowCount(partitions[0].ID, autoanalyze.DistMinRowCount-1)
+	setRowCount(partitions[1].ID, 1)
+	require.True(t, analyzePartitions())
+	tk.MustQuery(allTasks).Check(testkit.Rows(succeededTask, succeededTask))
 }

@@ -39,9 +39,16 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// distMinRowCount is the row count from which a statement goes to DXF. A task
+	// adds seconds of scheduling, which pays off only for a long statement. The
+	// value is a conservative round number, not a measured break-even point.
+	distMinRowCount = 1_000_000
+)
+
 // Register registers the auto-analyze task type to DXF and hooks the stats
-// owner so that it dispatches auto-analyze statements through DXF when
-// tidb_enable_dist_auto_analyze is ON.
+// owner so that it dispatches the auto-analyze statements of big tables
+// through DXF when tidb_enable_dist_auto_analyze is ON.
 func Register() {
 	scheduler.RegisterSchedulerFactory(proto.AutoAnalyze,
 		func(ctx context.Context, task *proto.Task, param scheduler.Param) scheduler.Scheduler {
@@ -56,18 +63,44 @@ func Register() {
 	exec.SetDistRunner(dispatch)
 }
 
-// dispatch runs the analyze statement through DXF.
+// dispatch runs the analyze statement of a big table through DXF. It returns
+// false, before it changes anything, for a statement that it cannot describe or
+// whose table is below the row limit: the caller runs it as it does without DXF.
 func dispatch(
 	sctx sessionctx.Context,
 	statsHandle statstypes.StatsHandle,
 	_ sysproctrack.Tracker,
 	req *exec.DistRequest,
-) error {
-	taskMeta, err := newTaskMeta(sctx, req)
-	if err != nil {
-		return err
+) (bool, error) {
+	taskMeta, ok := newTaskMeta(sctx, req)
+	if !ok || !isBigTable(sctx, statsHandle, taskMeta.TableID) {
+		return false, nil
 	}
-	return runAsTask(sctx, statsHandle, taskMeta)
+	return true, runAsTask(sctx, statsHandle, taskMeta)
+}
+
+// isBigTable reports whether the stats cache of this node has at least
+// distMinRowCount rows for the table. A partitioned table counts the rows of its
+// partitions: in static prune mode ANALYZE does not correct the table-level count.
+func isBigTable(sctx sessionctx.Context, statsHandle statstypes.StatsHandle, tableID int64) bool {
+	tblInfo, ok := sctx.GetLatestInfoSchema().TableInfoByID(tableID)
+	if !ok {
+		return false
+	}
+	physicalIDs := []int64{tableID}
+	if pi := tblInfo.GetPartitionInfo(); pi != nil {
+		physicalIDs = make([]int64, 0, len(pi.Definitions))
+		for _, def := range pi.Definitions {
+			physicalIDs = append(physicalIDs, def.ID)
+		}
+	}
+	var rows int64
+	for _, id := range physicalIDs {
+		if tblStats, ok := statsHandle.GetNonPseudoPhysicalTableStats(id); ok && !tblStats.Pseudo {
+			rows += tblStats.RealtimeCount
+		}
+	}
+	return rows >= distMinRowCount
 }
 
 // runAsTask runs the statement as a DXF task and waits for it, so the slot of
@@ -128,8 +161,10 @@ func loadTableStats(ctx context.Context, sctx sessionctx.Context, statsHandle st
 	return errors.Trace(statsHandle.Update(ctx, is, ids...))
 }
 
-// newTaskMeta builds the task meta of the statement.
-func newTaskMeta(sctx sessionctx.Context, req *exec.DistRequest) (*TaskMeta, error) {
+// newTaskMeta builds the task meta of the statement. It returns false for a
+// statement that the meta cannot describe, which then runs on this node: a
+// missing table fails there as it does without DXF.
+func newTaskMeta(sctx sessionctx.Context, req *exec.DistRequest) (*TaskMeta, bool) {
 	meta := &TaskMeta{
 		SQL:                    req.SQL,
 		Params:                 make([]string, 0, len(req.Params)),
@@ -138,21 +173,21 @@ func newTaskMeta(sctx sessionctx.Context, req *exec.DistRequest) (*TaskMeta, err
 	for _, p := range req.Params {
 		s, ok := p.(string)
 		if !ok {
-			return nil, errors.Errorf("unexpected parameter %v of the auto analyze statement", p)
+			return nil, false
 		}
 		meta.Params = append(meta.Params, s)
 	}
 	// The meta needs the schema and the table name, which come first in every
 	// statement of the priority queue.
 	if len(meta.Params) < 2 {
-		return nil, errors.Errorf("the auto analyze statement %q names no table", req.SQL)
+		return nil, false
 	}
 	tblInfo, err := sctx.GetLatestInfoSchema().TableInfoByName(ast.NewCIStr(meta.Params[0]), ast.NewCIStr(meta.Params[1]))
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, false
 	}
 	meta.TableID = tblInfo.ID
-	return meta, nil
+	return meta, true
 }
 
 // submitTask submits the statement as a task that runs on one node.
