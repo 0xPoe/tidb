@@ -2952,6 +2952,13 @@ func (do *Domain) StopAutoAnalyze() {
 	do.stopAutoAnalyze.Store(true)
 }
 
+// AutoAnalyzeStopped reports whether StopAutoAnalyze was called, which a
+// graceful shutdown does before it kills the sys processes. A killed
+// auto-analyze process can thus tell the shutdown from any other kill.
+func (do *Domain) AutoAnalyzeStopped() bool {
+	return do.stopAutoAnalyze.Load()
+}
+
 // InitInstancePlanCache initializes the instance level plan cache for this Domain.
 func (do *Domain) InitInstancePlanCache() {
 	hardLimit := vardef.InstancePlanCacheMaxMemSize.Load()

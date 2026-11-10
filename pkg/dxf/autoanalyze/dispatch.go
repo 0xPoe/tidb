@@ -27,6 +27,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/dxf/framework/handle"
 	"github.com/pingcap/tidb/pkg/dxf/framework/proto"
 	"github.com/pingcap/tidb/pkg/dxf/framework/scheduler"
@@ -118,7 +119,7 @@ func isBigTable(sctx sessionctx.Context, statsHandle statstypes.StatsHandle, tab
 
 // runAsTask runs the statement as a DXF task and waits for it, so the slot of
 // tidb_auto_analyze_concurrency stays taken. The statement stays an auto-analyze
-// process here: a kill of it also cancels the task.
+// process here: a kill of it, except by a shutdown, also cancels the task.
 func runAsTask(
 	sctx sessionctx.Context,
 	statsHandle statstypes.StatsHandle,
@@ -157,6 +158,7 @@ func runAsTask(
 	// The task keys of a table share a prefix, by which activeTask finds them,
 	// and end in a UUID: DXF refuses a key that an earlier task has used.
 	keyPrefix := fmt.Sprintf("%s/%s/%d/", keyspace, proto.AutoAnalyze, taskMeta.TableID)
+	shuttingDown := domain.GetDomain(sctx).AutoAnalyzeStopped
 	start := time.Now()
 	// A stats owner that shut down or failed can have left a task that runs
 	// this statement. If that task succeeds, the statement is done.
@@ -167,7 +169,7 @@ func runAsTask(
 	failpoint.InjectCall("afterFindActiveTask")
 	adopted := task != nil
 	if adopted {
-		adopted = waitTask(ctx, task, killed) == nil
+		adopted = waitTask(ctx, task, killed, shuttingDown) == nil
 	}
 	if !adopted {
 		// A kill up to here ends the statement before it has a task of its own.
@@ -178,7 +180,7 @@ func runAsTask(
 		if err != nil {
 			return err
 		}
-		err = waitTask(ctx, task, killed)
+		err = waitTask(ctx, task, killed, shuttingDown)
 	}
 	if err == nil {
 		// A statement that runs here ends with loading the new stats into the cache
@@ -333,8 +335,9 @@ func targetScope() string {
 }
 
 // waitTask waits until the task succeeds. A kill cancels the task and waits
-// until the statement runs nowhere, for cancelWaitTimeout at most.
-func waitTask(ctx context.Context, task *proto.TaskBase, killed <-chan struct{}) error {
+// until the statement runs nowhere, for cancelWaitTimeout at most. A kill by the
+// shutdown of this node only ends the wait, so a task on another node runs on.
+func waitTask(ctx context.Context, task *proto.TaskBase, killed <-chan struct{}, shuttingDown func() bool) error {
 	waitCtx, stopWaiting := context.WithCancel(ctx)
 	defer stopWaiting()
 	var wg sync.WaitGroup
@@ -344,6 +347,12 @@ func waitTask(ctx context.Context, task *proto.TaskBase, killed <-chan struct{})
 		select {
 		case <-killed:
 		case <-waitCtx.Done():
+			return
+		}
+		if shuttingDown() {
+			// If this node runs the subtask, the shutdown also kills the
+			// statement, and the task fails.
+			stopWaiting()
 			return
 		}
 		timer := time.AfterFunc(cancelWaitTimeout, stopWaiting)
