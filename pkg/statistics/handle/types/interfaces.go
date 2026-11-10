@@ -579,3 +579,12 @@ type HistoryHandle interface {
 	DumpStatsToJSON(dbName string, tableInfo *model.TableInfo,
 		historyStatsExec sqlexec.RestrictedSQLExecutor, dumpPartitionStats bool) (*statsutil.JSONTable, error)
 }
+
+// GlobalStatsHandle is the part of the stats handle that merging global statistics works on.
+type GlobalStatsHandle interface {
+	SPool() syssession.Pool
+	handleutil.TableInfoGetter
+	LoadTablePartitionStats(tableInfo *model.TableInfo, partitionDef *model.PartitionDefinition) (*statistics.Table, error)
+	SaveColOrIdxStatsToStorage(tableID int64, count, modifyCount int64, isIndex int, hg *statistics.Histogram,
+		cms *statistics.CMSketch, topN *statistics.TopN, fms *statistics.FMSketch, statsVersion int, updateAnalyzeTime bool, source string) (err error)
+}

@@ -93,7 +93,7 @@ func toSQLIndex(isIndex bool) int {
 // └────────────────────────┘        └───────────────────────┘
 type AsyncMergePartitionStats2GlobalStats struct {
 	is                  infoschema.InfoSchema
-	statsHandle         statstypes.StatsHandle
+	statsHandle         statstypes.GlobalStatsHandle
 	globalStats         *GlobalStats
 	cmsketch            chan mergeItem[*statistics.CMSketch]
 	fmsketch            chan mergeItem[*statistics.FMSketch]
@@ -124,7 +124,7 @@ type AsyncMergePartitionStats2GlobalStats struct {
 
 // NewAsyncMergePartitionStats2GlobalStats creates a new AsyncMergePartitionStats2GlobalStats.
 func NewAsyncMergePartitionStats2GlobalStats(
-	statsHandle statstypes.StatsHandle,
+	statsHandle statstypes.GlobalStatsHandle,
 	globalTableInfo *model.TableInfo,
 	histIDs []int64,
 	is infoschema.InfoSchema) (*AsyncMergePartitionStats2GlobalStats, error) {
