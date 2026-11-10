@@ -639,8 +639,13 @@ func writeSavedAnalyzeOption(sql *strings.Builder, rawOpts map[ast.AnalyzeOption
 }
 
 func (e *AnalyzeExec) saveAnalyzeOptions() error {
-	if !vardef.PersistAnalyzeOptions.Load() || len(e.OptionsMap) == 0 {
+	if len(e.OptionsMap) == 0 {
 		return nil
+	}
+	persist, err := core.KeyspaceGlobalVar(
+		e.Ctx().GetPlanCtx(), vardef.TiDBPersistAnalyzeOptions, variable.BoolToOnOff(vardef.PersistAnalyzeOptions.Load()))
+	if err != nil || !variable.TiDBOptOn(persist) {
+		return err
 	}
 	// only to save table options if dynamic prune mode
 	dynamicPrune := variable.PartitionPruneMode(e.Ctx().GetSessionVars().PartitionPruneMode.Load()) == variable.Dynamic
@@ -687,7 +692,7 @@ func (e *AnalyzeExec) saveAnalyzeOptions() error {
 	}
 	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnDDL)
 	exec := e.Ctx().GetRestrictedSQLExecutor()
-	_, _, err := exec.ExecRestrictedSQL(ctx, nil, sql.String())
+	_, _, err = exec.ExecRestrictedSQL(ctx, nil, sql.String())
 	if err != nil {
 		return err
 	}

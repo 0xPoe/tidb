@@ -2396,7 +2396,10 @@ func (b *PlanBuilder) getFullAnalyzeColumnsInfo(
 
 	switch columnChoice {
 	case ast.DefaultChoice:
-		columnOptions := vardef.AnalyzeColumnOptions.Load()
+		columnOptions, err := KeyspaceGlobalVar(b.ctx, vardef.TiDBAnalyzeColumnOptions, vardef.AnalyzeColumnOptions.Load())
+		if err != nil {
+			return nil, nil, err
+		}
 		switch columnOptions {
 		case ast.AllColumns.String():
 			return tbl.TableInfo.Columns, nil, nil
@@ -2887,7 +2890,11 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 		maps.Copy(resetOpts, astResets)
 	}
 
-	tblFilledOpts := fillAnalyzeOptions(AnalyzeOptionDefault(), tblOpts)
+	optDefaults, err := analyzeOptionDefault(b.ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	tblFilledOpts := fillAnalyzeOptions(optDefaults, tblOpts)
 
 	tblColsInfo, tblColList, err := b.getFullAnalyzeColumnsInfo(tbl, tblColChoice, tblColList, predicateCols, mustAnalyzedCols, mustAllColumns, false)
 	if err != nil {
@@ -2946,7 +2953,7 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 			savedColChoice, savedColList := pickColumnList(parSavedColChoice, parSavedColList, tblSavedColChoice, tblSavedColList)
 			// then merge statement level options
 			mergedOpts := mergeAnalyzeOptions(astOpts, stmtResets, savedOpts)
-			filledMergedOpts := fillAnalyzeOptions(AnalyzeOptionDefault(), mergedOpts)
+			filledMergedOpts := fillAnalyzeOptions(optDefaults, mergedOpts)
 			finalColChoice, mergedColList := pickColumnList(astColChoice, astColList, savedColChoice, savedColList)
 			finalColsInfo, finalColList, err := b.getFullAnalyzeColumnsInfo(tbl, finalColChoice, mergedColList, predicateCols, mustAnalyzedCols, mustAllColumns, false)
 			if err != nil {
@@ -3084,7 +3091,12 @@ func (b *PlanBuilder) appendAnalyzeVersionOverwriteWarning() {
 func (b *PlanBuilder) buildAnalyzeTable(as *ast.AnalyzeTableStmt, opts map[ast.AnalyzeOptionType]uint64, version int) (base.Plan, error) {
 	p := Analyze{Opts: opts}.Init(b.ctx, b.getSelectOffset())
 	p.OptionsMap = make(map[int64]V2AnalyzeOptions)
-	usePersistedOptions := vardef.PersistAnalyzeOptions.Load()
+	persistOptions, err := KeyspaceGlobalVar(
+		b.ctx, vardef.TiDBPersistAnalyzeOptions, variable.BoolToOnOff(vardef.PersistAnalyzeOptions.Load()))
+	if err != nil {
+		return nil, err
+	}
+	usePersistedOptions := variable.TiDBOptOn(persistOptions)
 
 	// Construct tasks for each table.
 	for _, tbl := range as.TableNames {
@@ -3179,6 +3191,39 @@ var analyzeOptionLimit = map[ast.AnalyzeOptionType]uint64{
 	ast.AnalyzeOptNumSamples:    5000000,
 	ast.AnalyzeOptSampleRate:    math.Float64bits(1),
 	ast.AnalyzeOptNDVRate:       math.Float64bits(1),
+}
+
+// KeyspaceGlobalVar returns the GLOBAL value of a variable in the keyspace of the session.
+// processValue, the process level mirror, is only right outside a cross keyspace session.
+func KeyspaceGlobalVar(sctx base.PlanContext, name string, processValue string) (string, error) {
+	if !sctx.IsCrossKS() {
+		return processValue, nil
+	}
+	return sctx.GetSessionVars().GlobalVarsAccessor.GetGlobalSysVar(name)
+}
+
+// analyzeOptionDefault returns the default analyze options of the keyspace of
+// the session, see KeyspaceGlobalVar.
+func analyzeOptionDefault(sctx base.PlanContext) (map[ast.AnalyzeOptionType]uint64, error) {
+	defaults := AnalyzeOptionDefault()
+	if !sctx.IsCrossKS() {
+		return defaults, nil
+	}
+	for opt, name := range map[ast.AnalyzeOptionType]string{
+		ast.AnalyzeOptNumBuckets: vardef.TiDBAnalyzeDefaultNumBuckets,
+		ast.AnalyzeOptNumTopN:    vardef.TiDBAnalyzeDefaultNumTopN,
+	} {
+		val, err := sctx.GetSessionVars().GlobalVarsAccessor.GetGlobalSysVar(name)
+		if err != nil {
+			return nil, err
+		}
+		n, err := strconv.ParseUint(val, 10, 64)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		defaults[opt] = n
+	}
+	return defaults, nil
 }
 
 // AnalyzeOptionDefault returns the default analyze options.
@@ -3311,7 +3356,11 @@ func (b *PlanBuilder) buildAnalyze(as *ast.AnalyzeTableStmt) (base.Plan, error) 
 	// saved options drops it and fillAnalyzeOptions supplies the default. When
 	// persistence is on, the per-table options built by
 	// buildAnalyzeFullSamplingTask take precedence over these in the executor.
-	filledOpts := fillAnalyzeOptions(AnalyzeOptionDefault(), mergeAnalyzeOptions(stmtOpts, stmtResets, nil))
+	optDefaults, err := analyzeOptionDefault(b.ctx)
+	if err != nil {
+		return nil, err
+	}
+	filledOpts := fillAnalyzeOptions(optDefaults, mergeAnalyzeOptions(stmtOpts, stmtResets, nil))
 
 	if as.IndexFlag {
 		if len(as.IndexNames) == 0 {
