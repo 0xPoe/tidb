@@ -285,7 +285,7 @@ func newTaskMeta(sctx sessionctx.Context, req *exec.DistRequest) (*TaskMeta, boo
 	if err != nil {
 		return nil, false
 	}
-	meta.TableID = tblInfo.ID
+	meta.DBID, meta.TableID = tblInfo.DBID, tblInfo.ID
 	return meta, true
 }
 

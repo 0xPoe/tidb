@@ -14,10 +14,23 @@
 
 package autoanalyze
 
+import "github.com/pingcap/tidb/pkg/session/syssession"
+
+// WaitIdle exports waitIdle for test.
+func (p *statementPool) WaitIdle() {
+	p.waitIdle()
+}
+
 // DistMinRowCount exports distMinRowCount for test.
 const DistMinRowCount = distMinRowCount
 
 var (
+	// RunOnServiceNode exports runOnServiceNode for test.
+	RunOnServiceNode = runOnServiceNode
+	// NewStatementPool creates a statementPool for test.
+	NewStatementPool = func(p *syssession.AdvancedSessionPool) *statementPool {
+		return &statementPool{AdvancedSessionPool: p}
+	}
 	// WithStatsSession exports withStatsSession for test.
 	WithStatsSession = withStatsSession
 	// OrderByUsedSlots exports orderByUsedSlots for test.

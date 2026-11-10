@@ -15,6 +15,11 @@
 // Package autoanalyze runs the auto-analyze statements of big tables as DXF
 // tasks: the stats owner keeps the priority queue and the concurrency control,
 // and each statement runs on the least used DXF node of the target scope.
+//
+// On the classic kernel the statement runs on a TiDB node of the cluster. On
+// the next-gen kernel it runs on a DXF service node, which belongs to the
+// SYSTEM keyspace and serves the task keyspace through a runtime that only
+// knows the system tables, see service_exec.go.
 package autoanalyze
 
 import (
@@ -31,7 +36,10 @@ type TaskMeta struct {
 	// NeedVersionRewriteWarn tells the node that runs the statement to log that
 	// it rewrites version 1 statistics.
 	NeedVersionRewriteWarn bool `json:"need_version_rewrite_warn,omitempty"`
-	// TableID identifies the table the statement analyzes.
+	// DBID and TableID identify the table the statement analyzes. A DXF service
+	// node that runs the statement for another keyspace loads this table, and
+	// only this one, into the info schema of its sessions.
+	DBID    int64 `json:"db_id"`
 	TableID int64 `json:"table_id"`
 }
 
