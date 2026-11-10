@@ -18,6 +18,7 @@ import (
 	"context"
 	"math"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
@@ -55,6 +56,34 @@ func execOptionForAnalyzeVersion(statsVer int, needVersionRewriteWarn bool, sql 
 	return sqlexec.ExecOptionAnalyzeVer2
 }
 
+// DistRequest is an auto-analyze statement that may run on another TiDB node.
+type DistRequest struct {
+	// SQL is the statement template, such as "analyze table %n.%n".
+	SQL string
+	// Params are the arguments of SQL.
+	Params []any
+	// NeedVersionRewriteWarn tells the node that runs the statement to log that
+	// it rewrites version 1 statistics.
+	NeedVersionRewriteWarn bool
+}
+
+// DistRunner runs an auto-analyze statement on some TiDB node and waits for its
+// result. sctx is an idle session of the current node, whose keyspace owns the
+// statement.
+type DistRunner func(
+	sctx sessionctx.Context,
+	statsHandle statstypes.StatsHandle,
+	sysProcTracker sysproctrack.Tracker,
+	req *DistRequest,
+) error
+
+var distRunner atomic.Pointer[DistRunner]
+
+// SetDistRunner sets the runner used when tidb_enable_dist_auto_analyze is ON.
+func SetDistRunner(r DistRunner) {
+	distRunner.Store(&r)
+}
+
 // AutoAnalyze executes the auto analyze task.
 func AutoAnalyze(
 	sctx sessionctx.Context,
@@ -66,7 +95,13 @@ func AutoAnalyze(
 	params ...any,
 ) bool {
 	startTime := time.Now()
-	_, _, err := RunAnalyzeStmt(sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
+	var err error
+	if r := distRunner.Load(); r != nil && vardef.EnableDistAutoAnalyze.Load() {
+		req := &DistRequest{SQL: sql, Params: params, NeedVersionRewriteWarn: needVersionRewriteWarn}
+		err = (*r)(sctx, statsHandle, sysProcTracker, req)
+	} else {
+		_, _, err = RunAnalyzeStmt(sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
+	}
 	dur := time.Since(startTime)
 	metrics.AutoAnalyzeHistogram.Observe(dur.Seconds())
 	if err != nil {
