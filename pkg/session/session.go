@@ -216,6 +216,10 @@ type session struct {
 	infoCache       *infoschema.InfoCache
 	store           kv.Storage
 
+	// crossKSSessPool is the session pool of the keyspace runtime that a cross
+	// keyspace session belongs to.
+	crossKSSessPool util.SessionPool
+
 	sessionPlanCache sessionctx.SessionPlanCache
 
 	sessionVars    *variable.SessionVars
@@ -1308,6 +1312,11 @@ func sqlForLog(sql string) string {
 }
 
 func (s *session) sysSessionPool() util.SessionPool {
+	if s.crossKSSessPool != nil {
+		// A cross keyspace session has no domain, its internal sessions come from
+		// the pool of the runtime of its keyspace.
+		return s.crossKSSessPool
+	}
 	return domain.GetDomain(s).SysSessionPool()
 }
 
@@ -4970,9 +4979,18 @@ func createCrossKSSession(currKSStore kv.Storage, targetKS string, validator val
 	if err != nil {
 		return nil, err
 	}
+	sessPool, err := dom.GetKSSessPool(targetKS)
+	if err != nil {
+		return nil, err
+	}
 	// TODO: use the schema validator of the target keyspace when we implement
 	// the info schema syncer for cross keyspace access.
-	return createSessionWithOpt(store, nil, validator, infoCache, nil)
+	se, err := createSessionWithOpt(store, nil, validator, infoCache, nil)
+	if err != nil {
+		return nil, err
+	}
+	se.crossKSSessPool = sessPool
+	return se, nil
 }
 
 func createSessionWithOpt(
