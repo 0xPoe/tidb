@@ -23,9 +23,12 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/domain/infosync"
 	"github.com/pingcap/tidb/pkg/domain/serverinfo"
+	"github.com/pingcap/tidb/pkg/dxf/framework/storage"
+	dxftestutil "github.com/pingcap/tidb/pkg/dxf/framework/testutil"
 	"github.com/pingcap/tidb/pkg/keyspace"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
@@ -518,8 +521,20 @@ func TestCleanupCorruptedAnalyzeJobsOnDeadInstances(t *testing.T) {
 
 	c.AppendInt64(0, int64(3))          // id
 	c.AppendString(1, "127.0.0.1:4000") // valid instance
+
+	c.AppendInt64(0, int64(4))         // id
+	c.AppendString(1, "10.0.0.2:4000") // live DXF node, no server of the keyspace
 	// Create a row from the chunk
-	rows := []chunk.Row{c.GetRow(0), c.GetRow(1), c.GetRow(2)}
+	rows := []chunk.Row{c.GetRow(0), c.GetRow(1), c.GetRow(2), c.GetRow(3)}
+	// Only next-gen also counts the DXF service nodes as alive.
+	deadJobIDs := []string{"2", "4"}
+	if kerneltype.IsNextGen() {
+		_, taskMgr, ctx := dxftestutil.InitTableTest(t)
+		require.NoError(t, taskMgr.InitMeta(ctx, "10.0.0.2:4000", ""))
+		storage.SetDXFSvcTaskMgr(taskMgr)
+		t.Cleanup(func() { storage.SetDXFSvcTaskMgr(nil) })
+		deadJobIDs = []string{"2"}
+	}
 	// Set up the mock function to return the row
 	exec.EXPECT().ExecRestrictedSQL(
 		gomock.All(&test.CtxMatcher{}),
@@ -532,7 +547,7 @@ func TestCleanupCorruptedAnalyzeJobsOnDeadInstances(t *testing.T) {
 		gomock.All(&test.CtxMatcher{}),
 		util.UseCurrentSessionOpt,
 		autoanalyze.BatchUpdateAnalyzeJobSQL,
-		[]any{[]string{"2"}},
+		[]any{deadJobIDs},
 	).Return(nil, nil, nil)
 
 	_, err := infosync.GlobalInfoSyncerInit(context.Background(), "t", func() uint64 { return 1 }, nil, nil, nil, nil, keyspace.CodecV1, true, nil)
