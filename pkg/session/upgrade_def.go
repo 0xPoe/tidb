@@ -544,6 +544,9 @@ const (
 	// version319 adds ndv_rate to mysql.analyze_options and keeps sampled NDV
 	// off on upgraded clusters.
 	version319 = 319
+
+	// version320 sets tidb_enable_dist_auto_analyze to OFF for upgraded clusters.
+	version320 = 320
 )
 
 // versionedUpgradeFunction is a struct that holds the upgrade function related
@@ -557,7 +560,7 @@ type versionedUpgradeFunction struct {
 
 // currentBootstrapVersion is defined as a variable, so we can modify its value for testing.
 // please make sure this is the largest version
-var currentBootstrapVersion int64 = version319
+var currentBootstrapVersion int64 = version320
 
 var (
 	// this list must be ordered by version in ascending order, and the function
@@ -751,6 +754,7 @@ var (
 		{version: version317, fn: upgradeToVer317},
 		{version: version318, fn: upgradeToVer318},
 		{version: version319, fn: upgradeToVer319},
+		{version: version320, fn: upgradeToVer320},
 	}
 )
 
@@ -2376,4 +2380,10 @@ func upgradeToVer319(s sessionapi.Session, _ int64) {
 	// Keep sampled NDV off on upgraded clusters: old TiDB cannot read sampled
 	// sketches, so it is turned on only after every node is upgraded.
 	initGlobalVariableIfNotExists(s, vardef.TiDBAnalyzeSampledNDVThreshold, 0)
+}
+
+func upgradeToVer320(s sessionapi.Session, _ int64) {
+	// Keep auto-analyze on the stats owner in upgraded clusters: a node of an
+	// old version cannot run the tasks, so only new clusters get the ON default.
+	initGlobalVariableIfNotExists(s, vardef.TiDBEnableDistAutoAnalyze, vardef.Off)
 }
