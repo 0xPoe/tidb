@@ -752,7 +752,14 @@ func recordHistoricalStats(sctx sessionctx.Context, tableID int64) error {
 	if !historicalStatsEnabled {
 		return nil
 	}
-	historicalStatsWorker := domain.GetDomain(sctx).GetHistoricalStatsWorker()
+	dom := domain.GetDomain(sctx)
+	if dom == nil {
+		// A cross keyspace session has no domain and thus no worker to dump the
+		// historical stats in the background, so dump them here.
+		is := sctx.GetLatestInfoSchema().(infoschema.InfoSchema)
+		return domain.DumpHistoricalStatsWithInfoSchema(is, tableID, statsHandle)
+	}
+	historicalStatsWorker := dom.GetHistoricalStatsWorker()
 	historicalStatsWorker.SendTblToDumpHistoricalStats(tableID)
 	return nil
 }
