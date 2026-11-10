@@ -155,6 +155,13 @@ func runAsTask(
 
 	keyspace := sctx.GetStore().GetKeyspace()
 	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalDistTask)
+	if kv.IsUserKS(sctx.GetStore()) {
+		// A DXF service node cannot ask the nodes of this keyspace to flush their
+		// stats deltas, so flush them before submitting.
+		if _, _, err := statsutil.ExecWithOpts(sctx, nil, "flush stats_delta %n.%n cluster", taskMeta.Params[0], taskMeta.Params[1]); err != nil {
+			return errors.Annotate(err, "flush stats delta before dispatching auto analyze")
+		}
+	}
 	// The task keys of a table share a prefix, by which activeTask finds them,
 	// and end in a UUID: DXF refuses a key that an earlier task has used.
 	keyPrefix := fmt.Sprintf("%s/%s/%d/", keyspace, proto.AutoAnalyze, taskMeta.TableID)
