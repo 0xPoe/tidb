@@ -32,11 +32,11 @@ import (
 
 // statsHistoryImpl implements util.StatsHistory.
 type statsHistoryImpl struct {
-	statsHandle types.StatsHandle
+	statsHandle types.HistoryHandle
 }
 
 // NewStatsHistory creates a new StatsHistory.
-func NewStatsHistory(statsHandle types.StatsHandle,
+func NewStatsHistory(statsHandle types.HistoryHandle,
 ) types.StatsHistory {
 	return &statsHistoryImpl{
 		statsHandle: statsHandle,

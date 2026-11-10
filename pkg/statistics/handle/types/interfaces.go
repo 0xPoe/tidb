@@ -570,3 +570,12 @@ type ReadWriterHandle interface {
 	RecordHistoricalStatsMeta(version uint64, source string, enforce bool, tableIDs ...int64)
 	CheckHistoricalStatsEnable() (enable bool, err error)
 }
+
+// HistoryHandle is the part of the stats handle that a StatsHistory works on.
+type HistoryHandle interface {
+	SPool() syssession.Pool
+	Get(tableID int64) (*statistics.Table, bool)
+	TableStatsToJSON(dbName string, tableInfo *model.TableInfo, physicalID int64, snapshot uint64) (*statsutil.JSONTable, error)
+	DumpStatsToJSON(dbName string, tableInfo *model.TableInfo,
+		historyStatsExec sqlexec.RestrictedSQLExecutor, dumpPartitionStats bool) (*statsutil.JSONTable, error)
+}
