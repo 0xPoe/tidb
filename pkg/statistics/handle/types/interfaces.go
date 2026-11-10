@@ -554,6 +554,7 @@ type AnalyzeStatsHandle interface {
 	FinishAnalyzeJob(job *statistics.AnalyzeJob, failReason error, analyzeType statistics.JobType)
 
 	CheckHistoricalStatsEnable() (enable bool, err error)
+	RecordHistoricalStatsToStorage(dbName string, tableInfo *model.TableInfo, physicalID int64, isPartition bool) (uint64, error)
 
 	StatsGlobal
 }
