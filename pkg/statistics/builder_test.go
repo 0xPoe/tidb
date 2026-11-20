@@ -74,6 +74,11 @@ func BenchmarkBuildHistAndTopN(b *testing.B) {
 	memoryTracker := memory.NewTracker(10, 1024*1024*1024)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		for ordinal, sample := range collector.Samples {
+			sample.Ordinal = ordinal
+		}
+		b.StartTimer()
 		_, _, _ = BuildHistAndTopN(ctx, 256, 500, 0, collector, filedType, true, memoryTracker)
 	}
 }
@@ -127,6 +132,11 @@ func BenchmarkBuildHistAndTopNWithLowNDV(b *testing.B) {
 	memoryTracker := memory.NewTracker(10, 1024*1024*1024)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		for ordinal, sample := range collector.Samples {
+			sample.Ordinal = ordinal
+		}
+		b.StartTimer()
 		_, _, _ = BuildHistAndTopN(ctx, 256, 500, 0, collector, filedType, true, memoryTracker)
 	}
 }
@@ -178,7 +188,7 @@ func BenchmarkSortSampleItems(b *testing.B) {
 			b.ResetTimer()
 			for range b.N {
 				copy(items, input)
-				require.NoError(b, sortSampleItems(sc, items))
+				require.NoError(b, sortSampleItems(sc, items, true))
 			}
 		})
 	}

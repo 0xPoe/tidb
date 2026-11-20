@@ -15,6 +15,7 @@
 package statistics
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/collate"
 	"github.com/pingcap/tidb/pkg/util/fastrand"
+	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"github.com/pingcap/tipb/go-tipb"
 	"github.com/twmb/murmur3"
@@ -51,11 +53,14 @@ type SampleItem struct {
 // EmptySampleItemSize is the size of empty SampleItem, 96 = 72 (datum) + 8 (int) + 16.
 const EmptySampleItemSize = int64(unsafe.Sizeof(SampleItem{}))
 
-func sortSampleItems(sc *stmtctx.StatementContext, items []*SampleItem) error {
+// sortSampleItems sorts items by value. Equal values keep their input order,
+// because the histogram bounds and the correlation read the sorted items.
+// Column samples must have strictly increasing Ordinal values in input order.
+func sortSampleItems(sc *stmtctx.StatementContext, items []*SampleItem, isColumn bool) error {
 	typeCtx := sc.TypeCtx()
 	collator := collate.GetBinaryCollator()
 	var firstErr error
-	slices.SortStableFunc(items, func(i, j *SampleItem) int {
+	compareValues := func(i, j *SampleItem) int {
 		cmp, err := i.Value.Compare(typeCtx, &j.Value, collator)
 		if err != nil {
 			if firstErr == nil {
@@ -64,6 +69,28 @@ func sortSampleItems(sc *stmtctx.StatementContext, items []*SampleItem) error {
 			return -1
 		}
 		return cmp
+	}
+	// Index samples leave Ordinal at zero. Use a stable sort to keep equal
+	// values in their input order.
+	// JSON compares an int and a float within 1e-8 as equal, which is not
+	// transitive, so an unstable sort can give a different order.
+	if !isColumn || (len(items) > 0 && items[0].Value.Kind() == types.KindMysqlJSON) {
+		slices.SortStableFunc(items, compareValues)
+		return firstErr
+	}
+	if intest.InTest {
+		for i := 1; i < len(items); i++ {
+			intest.Assert(items[i-1].Ordinal < items[i].Ordinal,
+				"column sample ordinals must be strictly increasing")
+		}
+	}
+	// The ascending Ordinal makes the order total, so the unstable sort gives
+	// the stable order without the merge cost of a stable sort.
+	slices.SortFunc(items, func(a, b *SampleItem) int {
+		if c := compareValues(a, b); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Ordinal, b.Ordinal)
 	})
 	return firstErr
 }

@@ -589,6 +589,9 @@ func SubTestBuild() func(*testing.T) {
 		collectors, _, err := builder.CollectColumnStats()
 		require.NoError(t, err)
 		require.Equal(t, 1, len(collectors))
+		for i, sample := range collectors[0].Samples {
+			sample.Ordinal = i
+		}
 		col, err = BuildColumn(mock.NewContext(), 256, 2, collectors[0], types.NewFieldType(mysql.TypeLonglong))
 		require.NoError(t, err)
 		checkRepeats(t, col)

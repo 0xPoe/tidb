@@ -16,6 +16,7 @@ package statistics
 
 import (
 	"math/rand"
+	"slices"
 	"testing"
 	"time"
 
@@ -173,6 +174,9 @@ func TestBuildStatsOnRowSample(t *testing.T) {
 		require.NoError(t, err)
 		data = append(data, &SampleItem{Value: d})
 	}
+	for i, sample := range data {
+		sample.Ordinal = i
+	}
 	collector := &SampleCollector{
 		Samples:   data,
 		NullCount: 0,
@@ -231,6 +235,9 @@ func TestBuildSampleFullNDV(t *testing.T) {
 		// Don't add these to sample data - this creates the discrepancy
 	}
 
+	for i, sample := range data {
+		sample.Ordinal = i
+	}
 	collector := &SampleCollector{
 		Samples:   data,
 		NullCount: 0,
@@ -284,11 +291,11 @@ func TestBuildHistAndTopNUsesAnalyzeDefaultGlobals(t *testing.T) {
 			d := types.NewIntDatum(value)
 			err := sketch.InsertValue(ctx.GetSessionVars().StmtCtx, d)
 			require.NoError(t, err)
-			data = append(data, &SampleItem{Value: d})
+			data = append(data, &SampleItem{Value: d, Ordinal: len(data)})
 		}
 	}
 	collector := &SampleCollector{
-		Samples:   data,
+		Samples:   slices.Clone(data),
 		NullCount: 0,
 		Count:     int64(len(data)),
 		FMSketch:  sketch,
@@ -301,11 +308,13 @@ func TestBuildHistAndTopNUsesAnalyzeDefaultGlobals(t *testing.T) {
 	require.Len(t, topN.TopN, 1)
 	require.Equal(t, 2, hist.Len())
 
+	collector.Samples = slices.Clone(data)
 	explicitHist, explicitTopN, err := BuildHistAndTopN(ctx, 4, 5, 1, collector, tp, true, nil)
 	require.NoError(t, err)
 	require.Len(t, explicitTopN.TopN, 5)
 	require.NotNil(t, explicitHist)
 
+	collector.Samples = slices.Clone(data)
 	explicitHist, explicitTopN, err = BuildHistAndTopN(ctx, 5, 4, 1, collector, tp, true, nil)
 	require.NoError(t, err)
 	require.Len(t, explicitTopN.TopN, 1)
@@ -440,13 +449,83 @@ func SubTestCollectorProtoConversion(s *testSampleSuite) func(*testing.T) {
 
 func SubTestSortSampleItems(t *testing.T) {
 	sc := stmtctx.NewStmtCtx()
+	typeCtx := sc.TypeCtx()
+	collator := collate.GetBinaryCollator()
+	// stableOrder is the order that a stable sort by value alone gives.
+	stableOrder := func(items []*SampleItem) []*SampleItem {
+		sorted := slices.Clone(items)
+		slices.SortStableFunc(sorted, func(a, b *SampleItem) int {
+			c, err := a.Value.Compare(typeCtx, &b.Value, collator)
+			require.NoError(t, err)
+			return c
+		})
+		return sorted
+	}
+
+	decimals := make([]types.Datum, 0, 9)
+	strs := make([]types.Datum, 0, 20)
+	mixed := make([]types.Datum, 0, 20)
+	jsons := make([]types.Datum, 0, 5)
+	// Decimals with a different scale, such as 1.5 and 1.50, compare as equal
+	// but are different datums.
+	for _, s := range []string{"-2.5", "0", "0.00", "1.5", "1.50", "1.500", "7", "7.00", "12345.67"} {
+		decimals = append(decimals, types.NewDecimalDatum(types.NewDecFromStringForTest(s)))
+	}
+	for _, s := range []string{"", " ", "a", "a ", "A", "ab", "abc", "b", "\x00", "\xff"} {
+		strs = append(strs, types.NewBytesDatum([]byte(s)), types.NewStringDatum(s))
+	}
+	for i := range 4 {
+		mixed = append(mixed, types.NewIntDatum(int64(i)), types.NewUintDatum(uint64(i)),
+			types.NewFloat64Datum(float64(i)), types.NewDecimalDatum(types.NewDecFromInt(int64(i))),
+			types.NewFloat64Datum(float64(i)+0.5))
+	}
+	// JSON compares 1 as equal to both floats, but the floats as not equal.
+	for _, v := range []any{int64(1), 1.000000005, 0.999999995, 1.0, int64(2)} {
+		jsons = append(jsons, types.NewJSONDatum(types.CreateBinaryJSON(v)))
+	}
+	r := rand.New(rand.NewSource(1))
+	for _, values := range []struct {
+		name  string
+		datum []types.Datum
+	}{{"decimal", decimals}, {"string", strs}, {"mixed", mixed}, {"json", jsons}} {
+		// Column samples have an ascending Ordinal, maybe with gaps for NULL
+		// rows. The index sort must ignore Ordinal.
+		for _, ordinals := range []struct {
+			name     string
+			isColumn bool
+			ordinal  func(i, n int) int
+		}{
+			{"ascending", true, func(i, _ int) int { return i }},
+			{"ascending with gaps", true, func(i, _ int) int { return 3*i + 1 }},
+			{"zero", false, func(int, int) int { return 0 }},
+			{"descending", false, func(i, n int) int { return n - i }},
+		} {
+			for _, n := range []int{0, 1, 2, 12, 13, 20, 21, 100, 5000} {
+				items := make([]*SampleItem, n)
+				for i := range items {
+					items[i] = &SampleItem{Value: values.datum[r.Intn(len(values.datum))], Ordinal: ordinals.ordinal(i, n)}
+				}
+				want := stableOrder(items)
+				require.NoError(t, sortSampleItems(sc, items, ordinals.isColumn))
+				for i := range items {
+					if items[i] != want[i] {
+						require.FailNowf(t, "the order differs from the stable order",
+							"values: %s, ordinal: %s, n: %d, position: %d", values.name, ordinals.name, n, i)
+					}
+				}
+			}
+		}
+	}
+
 	// The first compare fails and the later compares succeed. The error must
 	// not be lost, because the order is not valid after a failed compare.
-	items := []*SampleItem{
-		{Value: types.NewStringDatum("abc"), Ordinal: 0},
-		{Value: types.NewDecimalDatum(types.NewDecFromInt(1)), Ordinal: 1},
-		{Value: types.NewDecimalDatum(types.NewDecFromInt(2)), Ordinal: 2},
-		{Value: types.NewDecimalDatum(types.NewDecFromInt(3)), Ordinal: 3},
+	for _, isColumn := range []bool{false, true} {
+		items := []*SampleItem{
+			{Value: types.NewStringDatum("abc"), Ordinal: 0},
+			{Value: types.NewDecimalDatum(types.NewDecFromInt(1)), Ordinal: 1},
+			{Value: types.NewDecimalDatum(types.NewDecFromInt(2)), Ordinal: 2},
+			{Value: types.NewDecimalDatum(types.NewDecFromInt(3)), Ordinal: 3},
+		}
+		require.Error(t, sortSampleItems(sc, items, isColumn))
 	}
-	require.Error(t, sortSampleItems(sc, items))
 }

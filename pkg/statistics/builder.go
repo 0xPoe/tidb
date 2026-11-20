@@ -203,7 +203,7 @@ func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *Sa
 	}
 	sc := ctx.GetSessionVars().StmtCtx
 	samples := collector.Samples
-	err := sortSampleItems(sc, samples)
+	err := sortSampleItems(sc, samples, true)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +408,7 @@ func BuildHistAndTopN(
 	}
 	sc := ctx.GetSessionVars().StmtCtx
 	samples := collector.Samples
-	err := sortSampleItems(sc, samples)
+	err := sortSampleItems(sc, samples, isColumn)
 	if err != nil {
 		return nil, nil, err
 	}
