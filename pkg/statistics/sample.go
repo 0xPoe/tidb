@@ -84,14 +84,23 @@ func sortSampleItems(sc *stmtctx.StatementContext, items []*SampleItem, isColumn
 				"column sample ordinals must be strictly increasing")
 		}
 	}
-	// The ascending Ordinal makes the order total, so the unstable sort gives
-	// the stable order without the merge cost of a stable sort.
-	slices.SortFunc(items, func(a, b *SampleItem) int {
-		if c := compareValues(a, b); c != 0 {
-			return c
+	// Compare values only: an Ordinal tie-break makes all keys distinct, and
+	// pdqsort then cannot group equal values, which slows low-NDV columns.
+	slices.SortFunc(items, compareValues)
+	// Ordinal increases in input order, so sorting each run of equal values by
+	// Ordinal gives the stable order.
+	for i := 0; i < len(items); {
+		j := i + 1
+		for j < len(items) && compareValues(items[i], items[j]) == 0 {
+			j++
 		}
-		return cmp.Compare(a.Ordinal, b.Ordinal)
-	})
+		if j-i > 1 {
+			slices.SortFunc(items[i:j], func(a, b *SampleItem) int {
+				return cmp.Compare(a.Ordinal, b.Ordinal)
+			})
+		}
+		i = j
+	}
 	return firstErr
 }
 
