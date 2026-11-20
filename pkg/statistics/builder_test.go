@@ -131,6 +131,59 @@ func BenchmarkBuildHistAndTopNWithLowNDV(b *testing.B) {
 	}
 }
 
+// BenchmarkSortSampleItems measures the per-column sort of ANALYZE samples.
+// go test -benchmem -run=^$ -bench ^BenchmarkSortSampleItems$ github.com/pingcap/tidb/pkg/statistics
+// The sample count is config.DefRowsForSampleRate, the sample size of a large
+// table. Ordinal ascends in the input, as in the column samples of ANALYZE.
+func BenchmarkSortSampleItems(b *testing.B) {
+	const sampleCount = 110_000
+	sc := mock.NewContext().GetSessionVars().StmtCtx
+	newDecimal := func(r *rand.Rand, ndv int64) types.Datum {
+		// A DECIMAL(15,2) value.
+		dec := types.NewDecFromInt(1_000_000 + r.Int63n(ndv))
+		require.NoError(b, dec.Shift(-2))
+		d := types.NewDecimalDatum(dec)
+		d.SetLength(15)
+		d.SetFrac(2)
+		return d
+	}
+	newString := func(r *rand.Rand, ndv int64) types.Datum {
+		// The executor sorts the collation key bytes of a string column.
+		v := r.Int63n(ndv)
+		key := []byte("customer-name-")
+		for range 8 {
+			key = append(key, byte('a'+v%26))
+			v /= 26
+		}
+		return types.NewBytesDatum(key)
+	}
+	cases := []struct {
+		name     string
+		newValue func(r *rand.Rand, ndv int64) types.Datum
+		ndv      int64
+	}{
+		{"decimal/distinct", newDecimal, 100_000_000},
+		{"decimal/ndv=1000", newDecimal, 1000},
+		{"string/distinct", newString, 100_000_000},
+		{"string/ndv=1000", newString, 1000},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			r := rand.New(rand.NewSource(1))
+			input := make([]*SampleItem, sampleCount)
+			for i := range input {
+				input[i] = &SampleItem{Value: c.newValue(r, c.ndv), Ordinal: i}
+			}
+			items := make([]*SampleItem, sampleCount)
+			b.ResetTimer()
+			for range b.N {
+				copy(items, input)
+				require.NoError(b, sortSampleItems(sc, items))
+			}
+		})
+	}
+}
+
 // SequentialRangeChecker tests
 func TestSequentialRangeChecker(t *testing.T) {
 	ranges := []TopNWithRange{
