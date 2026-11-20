@@ -52,9 +52,11 @@ type SampleItem struct {
 const EmptySampleItemSize = int64(unsafe.Sizeof(SampleItem{}))
 
 func sortSampleItems(sc *stmtctx.StatementContext, items []*SampleItem) error {
+	typeCtx := sc.TypeCtx()
+	collator := collate.GetBinaryCollator()
 	var firstErr error
 	slices.SortStableFunc(items, func(i, j *SampleItem) int {
-		cmp, err := i.Value.Compare(sc.TypeCtx(), &j.Value, collate.GetBinaryCollator())
+		cmp, err := i.Value.Compare(typeCtx, &j.Value, collator)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
