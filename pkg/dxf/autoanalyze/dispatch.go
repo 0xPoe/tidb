@@ -19,6 +19,8 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +53,9 @@ const (
 	// rowLimit is the row count from which a statement goes to DXF, because a task adds
 	// seconds of scheduling. It is a conservative round number, not a measured break-even.
 	rowLimit = 1_000_000
+	// rowLimitFile overrides rowLimit when it holds an integer. TEST BUILD ONLY: it lets a
+	// cluster test switch the limit on the stats owner without a restart.
+	rowLimitFile = "/tmp/daa-row-limit"
 	// cancelRetryInterval is how long to wait before trying to cancel a task again.
 	cancelRetryInterval = time.Second
 	// cancelWaitTimeout limits the wait of a killed statement for its task, which stops within
@@ -108,7 +113,21 @@ func reachesRowLimit(statsHandle statstypes.StatsHandle, tblInfo *model.TableInf
 			rows += tblStats.RealtimeCount
 		}
 	}
-	return rows >= rowLimit
+	return rows >= currentRowLimit()
+}
+
+// currentRowLimit returns the integer in rowLimitFile, or rowLimit if the file is missing or
+// does not hold a non-negative integer.
+func currentRowLimit() int64 {
+	b, err := os.ReadFile(rowLimitFile)
+	if err != nil {
+		return rowLimit
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || n < 0 {
+		return rowLimit
+	}
+	return n
 }
 
 // analyzedPhysicalIDs returns the ID of the table, or the IDs of the partitions that the statement
