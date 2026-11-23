@@ -18,6 +18,7 @@ import (
 	"context"
 	"math"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
@@ -38,21 +39,48 @@ import (
 	"go.uber.org/zap"
 )
 
+func warnAnalyzeVersionRewrite(sql string, params ...any) {
+	escapedSQL, err := sqlescape.EscapeSQL(sql, params...)
+	intest.Assert(err == nil, "sql escaping should not fail")
+	// No need to fail the analyze task if the SQL escaping fails, just log the original SQL.
+	if err != nil {
+		escapedSQL = sql
+	}
+	statslogutil.StatsLogger().Warn(
+		"auto analyze rewrites legacy statistics version 1 to version 2",
+		zap.String("sql", escapedSQL),
+	)
+}
+
 func execOptionForAnalyzeVersion(statsVer int, needVersionRewriteWarn bool, sql string, params ...any) sqlexec.OptionFuncAlias {
 	if needVersionRewriteWarn {
-		escapedSQL, err := sqlescape.EscapeSQL(sql, params...)
-		intest.Assert(err == nil, "sql escaping should not fail")
-		// No need to fail the analyze task if the SQL escaping fails, just log the original SQL.
-		if err != nil {
-			escapedSQL = sql
-		}
-		statslogutil.StatsLogger().Warn(
-			"auto analyze rewrites legacy statistics version 1 to version 2",
-			zap.String("sql", escapedSQL),
-		)
+		warnAnalyzeVersionRewrite(sql, params...)
 	}
 	intest.Assert(statsVer == statistics.Version2, "auto analyze should use stats version 2")
 	return sqlexec.ExecOptionAnalyzeVer2
+}
+
+// AnalyzedTable is the table that an auto-analyze statement analyzes.
+type AnalyzedTable struct {
+	ID int64
+}
+
+// Dispatcher runs an auto-analyze statement on some TiDB node and waits for the result. sctx is an
+// idle session of the statement's keyspace.
+type Dispatcher func(
+	sctx sessionctx.Context,
+	statsHandle statstypes.StatsHandle,
+	sysProcTracker sysproctrack.Tracker,
+	table AnalyzedTable,
+	sql string,
+	params ...any,
+) error
+
+var dispatcher atomic.Pointer[Dispatcher]
+
+// SetDispatcher sets the dispatcher used when tidb_enable_dist_auto_analyze is ON.
+func SetDispatcher(d Dispatcher) {
+	dispatcher.Store(&d)
 }
 
 // AutoAnalyze executes the auto analyze task.
@@ -62,11 +90,21 @@ func AutoAnalyze(
 	sysProcTracker sysproctrack.Tracker,
 	statsVer int,
 	needVersionRewriteWarn bool,
+	table AnalyzedTable,
 	sql string,
 	params ...any,
 ) bool {
 	startTime := time.Now()
-	_, _, err := RunAnalyzeStmt(sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
+	var err error
+	if d := dispatcher.Load(); d != nil && vardef.EnableDistAutoAnalyze.Load() {
+		// Log on the owner so DXF metadata does not need a warning-only flag.
+		if needVersionRewriteWarn {
+			warnAnalyzeVersionRewrite(sql, params...)
+		}
+		err = (*d)(sctx, statsHandle, sysProcTracker, table, sql, params...)
+	} else {
+		_, _, err = RunAnalyzeStmt(sctx, statsHandle, sysProcTracker, statsVer, needVersionRewriteWarn, sql, params...)
+	}
 	dur := time.Since(startTime)
 	metrics.AutoAnalyzeHistogram.Observe(dur.Seconds())
 	if err != nil {
