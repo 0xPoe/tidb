@@ -16,6 +16,7 @@ package scheduler
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"time"
 
@@ -176,7 +177,29 @@ func (b *balancer) doBalanceSubtasks(ctx context.Context, task *proto.Task, elig
 	subtasksNeedSchedule := make([]*proto.SubtaskBase, 0)
 	remainder := averageSubtaskRemainder
 	executorWithOneMoreSubtask := make(map[string]struct{}, remainder)
+	keepRunning := task.Type == proto.AutoAnalyze && proto.DAAToggle(proto.DAANoPreemptFile)
 	for node, sts := range executorSubtasks {
+		if _, ok := adjustedNodeMap[node]; !ok && keepRunning && slices.Contains(eligibleNodes, node) {
+			// DO NOT MERGE: test switch. The node is alive: move only the subtasks that do not run.
+			var running, others []*proto.SubtaskBase
+			for _, st := range sts {
+				if st.State == proto.SubtaskStateRunning {
+					running = append(running, st)
+				} else {
+					others = append(others, st)
+				}
+			}
+			b.logger.Info("daa: keep running subtasks on a node without enough slots",
+				zap.Int64("task-id", task.ID), zap.String("node", node),
+				zap.Int("running", len(running)), zap.Int("moved", len(others)))
+			subtasksNeedSchedule = append(subtasksNeedSchedule, others...)
+			if len(running) > 0 {
+				executorSubtasks[node] = running
+			} else {
+				delete(executorSubtasks, node)
+			}
+			continue
+		}
 		if _, ok := adjustedNodeMap[node]; !ok {
 			b.logger.Info("dead node or not have enough slots, schedule subtasks away",
 				zap.Int64("task-id", task.ID),

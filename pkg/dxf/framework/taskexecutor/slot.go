@@ -101,8 +101,13 @@ func (sm *slotManager) canAlloc0(task *proto.TaskBase) (canAlloc bool, tasksNeed
 	}
 
 	usedSlots := 0
+	noPreempt := proto.DAAToggle(proto.DAANoPreemptFile)
 	for _, slotInfo := range sm.executorTasks {
 		if slotInfo.Compare(task) < 0 {
+			break
+		}
+		// DO NOT MERGE: test switch. A running AutoAnalyze task yields only to a higher priority.
+		if noPreempt && slotInfo.Type == proto.AutoAnalyze && slotInfo.Priority <= task.Priority {
 			break
 		}
 		tasksNeedFree = append(tasksNeedFree, slotInfo)

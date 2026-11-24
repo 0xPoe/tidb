@@ -18,6 +18,7 @@ import (
 	"cmp"
 	"context"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -39,6 +40,11 @@ var placed = &placements{nodes: make(map[int64]string)}
 // place returns nodes ordered for the task, fewest used slots first, and keeps the first as
 // its place. The place of another task counts as one used slot, which is what a task asks for.
 func (p *placements) place(taskID int64, nodes []string, usedSlots map[string]int) []string {
+	return p.placeWith(taskID, nodes, usedSlots, nil)
+}
+
+// placeWith is place, but a task in withSubtask is not counted again: usedSlots counts its subtask.
+func (p *placements) placeWith(taskID int64, nodes []string, usedSlots map[string]int, withSubtask map[int64]struct{}) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.nodes, taskID)
@@ -46,7 +52,10 @@ func (p *placements) place(taskID int64, nodes []string, usedSlots map[string]in
 	for _, node := range nodes {
 		used[node] = usedSlots[node]
 	}
-	for _, node := range p.nodes {
+	for id, node := range p.nodes {
+		if _, ok := withSubtask[id]; ok {
+			continue
+		}
 		used[node]++
 	}
 	ordered := orderByUsedSlots(nodes, used, taskID)
@@ -122,13 +131,52 @@ func (s *schedulerImpl) GetEligibleInstances(ctx context.Context, task *proto.Ta
 		// for such a task, to move the subtask away from a lost node.
 		return orderByUsedSlots(nodes, usedSlots, task.ID), nil
 	}
-	ordered := placed.place(task.ID, nodes, usedSlots)
+	fix := proto.DAAToggle(proto.DAAPlaceFixFile)
+	var withSubtask map[int64]struct{}
+	if fix {
+		usedSlots, withSubtask = s.usedSlotsAndTasks(ctx, usedSlots)
+	}
+	ordered := placed.placeWith(task.ID, nodes, usedSlots, withSubtask)
+	minUsed := -1
+	for _, n := range nodes {
+		if minUsed < 0 || usedSlots[n] < minUsed {
+			minUsed = usedSlots[n]
+		}
+	}
+	// DO NOT MERGE: test log. used is the number of subtasks on the node.
+	s.GetLogger().Info("daa placement", zap.Int64("task-id", task.ID), zap.Bool("fix", fix),
+		zap.String("node", ordered[0]), zap.Int("used", usedSlots[ordered[0]]), zap.Int("min-used", minUsed))
 	// The balancer may also ask after Close. Close sets closed before it
 	// releases, so one of the two releases comes after this place.
 	if s.closed.Load() {
 		placed.release(task.ID)
 	}
 	return ordered, nil
+}
+
+// usedSlotsAndTasks reads the used slots of each node and the tasks that have an active
+// subtask, from one read of the subtask table. It returns usedSlots unchanged on error.
+func (s *schedulerImpl) usedSlotsAndTasks(ctx context.Context, usedSlots map[string]int) (map[string]int, map[int64]struct{}) {
+	mgr, err := storage.GetTaskManager()
+	if err != nil {
+		return usedSlots, nil
+	}
+	rs, err := mgr.ExecuteSQLWithNewSession(ctx, `select exec_id, task_key, max(concurrency)
+		from mysql.tidb_background_subtask where state in (%?, %?) group by exec_id, task_key`,
+		proto.SubtaskStatePending, proto.SubtaskStateRunning)
+	if err != nil {
+		s.GetLogger().Warn("daa: read subtasks failed", zap.Error(err))
+		return usedSlots, nil
+	}
+	used := make(map[string]int, len(usedSlots))
+	tasks := make(map[int64]struct{}, len(rs))
+	for _, r := range rs {
+		used[r.GetString(0)] += int(r.GetInt64(2))
+		if id, err := strconv.ParseInt(r.GetString(1), 10, 64); err == nil {
+			tasks[id] = struct{}{}
+		}
+	}
+	return used, tasks
 }
 
 // orderByUsedSlots returns nodes, which is not empty, sorted by used slots, ascending. Nodes
