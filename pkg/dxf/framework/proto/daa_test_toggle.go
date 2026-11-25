@@ -14,7 +14,11 @@
 
 package proto
 
-import "os"
+import (
+	"os"
+	"strconv"
+	"strings"
+)
 
 // DO NOT MERGE: switches for a cluster test of the auto-analyze interruptions.
 const (
@@ -23,7 +27,22 @@ const (
 	// DAANoPreemptFile keeps running AutoAnalyze subtasks: no preemption by the same
 	// priority, and the balancer does not move them off a live node.
 	DAANoPreemptFile = "/tmp/daa-no-preempt"
+	// DAAAnalyzePriorityFile holds the priority of new AutoAnalyze tasks, read on the node that submits them.
+	DAAAnalyzePriorityFile = "/tmp/daa-analyze-priority"
+	// DAADrainTimeoutFile holds the seconds that a task of a higher priority waits for running AutoAnalyze
+	// tasks to finish before it preempts them. While it waits, the node starts no task of a lower rank.
+	DAADrainTimeoutFile = "/tmp/daa-drain-timeout"
 )
+
+// DAAIntFile reads the integer in the switch file, and reports whether the file exists and holds one.
+func DAAIntFile(file string) (int, bool) {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return 0, false
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	return v, err == nil
+}
 
 // DAAToggle reports whether the switch file exists on this node.
 func DAAToggle(file string) bool {

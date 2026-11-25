@@ -298,6 +298,11 @@ func (mgr *TaskManager) CreateTaskWithSession(
 		return 0, errors.Errorf("task required slots(%d) larger than cpu count(%d) of managed node", requiredSlots, cpuCount)
 	}
 	failpoint.InjectCall("beforeSubmitTask", &requiredSlots, &extraParams)
+	priority := proto.NormalPriority
+	// DO NOT MERGE: test switch for the priority of AutoAnalyze tasks.
+	if p, ok := proto.DAAIntFile(proto.DAAAnalyzePriorityFile); ok && tp == proto.AutoAnalyze && p >= 1 && p <= 1024 {
+		priority = p
+	}
 	extraParamBytes, err := json.Marshal(extraParams)
 	if err != nil {
 		return 0, errors.Trace(err)
@@ -305,7 +310,7 @@ func (mgr *TaskManager) CreateTaskWithSession(
 	_, err = sqlexec.ExecSQL(ctx, se.GetSQLExecutor(), `
 			insert into mysql.tidb_global_task(`+InsertTaskColumns+`)
 			values (%?, %?, %?, %?, %?, %?, %?, CURRENT_TIMESTAMP(), %?, %?, %?, %?)`,
-		key, tp, proto.TaskStatePending, proto.NormalPriority, requiredSlots,
+		key, tp, proto.TaskStatePending, priority, requiredSlots,
 		proto.StepInit, meta, targetScope, maxNodeCount, json.RawMessage(extraParamBytes), keyspace)
 	if err != nil {
 		return 0, err

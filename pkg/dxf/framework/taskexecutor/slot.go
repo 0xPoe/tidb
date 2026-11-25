@@ -96,8 +96,22 @@ func (sm *slotManager) canAlloc(task *proto.TaskBase) (canAlloc bool, tasksNeedF
 // - canAlloc: whether the instance can run the task.
 // - tasksNeedFree: the tasks that need to be preempted before running this task.
 func (sm *slotManager) canAlloc0(task *proto.TaskBase) (canAlloc bool, tasksNeedFree []*proto.TaskBase) {
+	canAlloc, tasksNeedFree, _ = sm.canAllocDAA0(task, true)
+	return canAlloc, tasksNeedFree
+}
+
+// canAllocDAAWithLock is canAllocDAA0 under the read lock.
+func (sm *slotManager) canAllocDAAWithLock(task *proto.TaskBase, preemptAnalyze bool) (bool, []*proto.TaskBase, bool) {
+	sm.RLock()
+	defer sm.RUnlock()
+	return sm.canAllocDAA0(task, preemptAnalyze)
+}
+
+// canAllocDAA0 is canAlloc0 with the test switches. drain reports that the task must wait for running
+// AutoAnalyze tasks of a lower priority, because preemptAnalyze is false.
+func (sm *slotManager) canAllocDAA0(task *proto.TaskBase, preemptAnalyze bool) (canAlloc bool, tasksNeedFree []*proto.TaskBase, drain bool) {
 	if int(sm.available.Load()) >= task.RequiredSlots {
-		return true, nil
+		return true, nil, false
 	}
 
 	usedSlots := 0
@@ -106,18 +120,24 @@ func (sm *slotManager) canAlloc0(task *proto.TaskBase) (canAlloc bool, tasksNeed
 		if slotInfo.Compare(task) < 0 {
 			break
 		}
-		// DO NOT MERGE: test switch. A running AutoAnalyze task yields only to a higher priority.
-		if noPreempt && slotInfo.Type == proto.AutoAnalyze && slotInfo.Priority <= task.Priority {
-			break
+		// DO NOT MERGE: test switch. A running AutoAnalyze task yields only to a higher priority,
+		// and only after the drain timeout when preemptAnalyze is false.
+		if noPreempt && slotInfo.Type == proto.AutoAnalyze {
+			if slotInfo.Priority <= task.Priority {
+				break
+			}
+			if !preemptAnalyze {
+				return false, nil, true
+			}
 		}
 		tasksNeedFree = append(tasksNeedFree, slotInfo)
 		usedSlots += slotInfo.RequiredSlots
 		if int(sm.available.Load())+usedSlots >= task.RequiredSlots {
-			return true, tasksNeedFree
+			return true, tasksNeedFree, false
 		}
 	}
 
-	return false, nil
+	return false, nil, false
 }
 
 // exchange is used to exchange the slots of old task with the new one.

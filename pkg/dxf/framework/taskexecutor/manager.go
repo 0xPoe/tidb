@@ -75,6 +75,8 @@ type Manager struct {
 	slotManager  *slotManager
 	nodeResource *proto.NodeResource
 	trace        *traceevent.Trace
+	// daaWaitSince is a test switch state: when a task first waited for running AutoAnalyze tasks.
+	daaWaitSince map[int64]time.Time
 }
 
 // NewManager creates a new task executor Manager.
@@ -216,12 +218,42 @@ func (m *Manager) handleTasks() {
 
 // handleExecutableTasks handles executable tasks.
 func (m *Manager) handleExecutableTasks(taskInfos []*storage.TaskExecInfo) {
+	// DO NOT MERGE: test switch. A task of a higher priority first waits up to the drain timeout for
+	// running AutoAnalyze tasks, and the node starts no task of a lower rank meanwhile.
+	if m.daaWaitSince == nil {
+		m.daaWaitSince = make(map[int64]time.Time)
+	}
+	present := make(map[int64]struct{}, len(taskInfos))
 	for _, task := range taskInfos {
-		canAlloc, tasksNeedFree := m.slotManager.canAlloc(task.TaskBase)
+		present[task.ID] = struct{}{}
+	}
+	for id := range m.daaWaitSince {
+		if _, ok := present[id]; !ok {
+			delete(m.daaWaitSince, id)
+		}
+	}
+	for _, task := range taskInfos {
+		preemptAnalyze, waited := true, time.Duration(0)
+		if timeout, ok := proto.DAAIntFile(proto.DAADrainTimeoutFile); ok {
+			since, seen := m.daaWaitSince[task.ID]
+			if !seen {
+				since = time.Now()
+			}
+			waited = time.Since(since)
+			preemptAnalyze = waited >= time.Duration(timeout)*time.Second
+		}
+		canAlloc, tasksNeedFree, drain := m.slotManager.canAllocDAAWithLock(task.TaskBase, preemptAnalyze)
+		if drain {
+			if _, seen := m.daaWaitSince[task.ID]; !seen {
+				m.daaWaitSince[task.ID] = time.Now()
+				m.logger.Info("daa: drain for a task of a higher priority", zap.Stringer("task", task.TaskBase))
+			}
+			break
+		}
 		if len(tasksNeedFree) > 0 {
 			m.cancelTaskExecutors(tasksNeedFree)
 			m.logger.Info("need to preempt tasks of low ranking", zap.Stringer("task", task.TaskBase),
-				zap.Stringers("preemptedTasks", tasksNeedFree))
+				zap.Stringers("preemptedTasks", tasksNeedFree), zap.Duration("daa-waited", waited))
 			// do not handle the tasks with low ranking if current task is waiting
 			// other tasks to free slots to make sure the order of running.
 			break
@@ -233,6 +265,10 @@ func (m *Manager) handleExecutableTasks(taskInfos []*storage.TaskExecInfo) {
 			continue
 		}
 		failpoint.InjectCall("beforeCallStartTaskExecutor", task.TaskBase)
+		if since, ok := m.daaWaitSince[task.ID]; ok {
+			m.logger.Info("daa: task starts after drain", zap.Int64("task-id", task.ID), zap.Duration("waited", time.Since(since)))
+			delete(m.daaWaitSince, task.ID)
+		}
 		if !m.startTaskExecutor(task.TaskBase) {
 			// we break to make sure the order of running.
 			// it's possible some other low ranking tasks alloc more slots at
