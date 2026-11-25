@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -298,6 +299,12 @@ func (mgr *TaskManager) CreateTaskWithSession(
 		return 0, errors.Errorf("task required slots(%d) larger than cpu count(%d) of managed node", requiredSlots, cpuCount)
 	}
 	failpoint.InjectCall("beforeSubmitTask", &requiredSlots, &extraParams)
+	// DO NOT MERGE: /tmp/daa-backfill-slots on the submitting node sets the required slots of add-index tasks.
+	if b, err := os.ReadFile("/tmp/daa-backfill-slots"); err == nil && tp == proto.Backfill {
+		if s, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && s >= 1 && s <= 64 {
+			requiredSlots = s
+		}
+	}
 	extraParamBytes, err := json.Marshal(extraParams)
 	if err != nil {
 		return 0, errors.Trace(err)

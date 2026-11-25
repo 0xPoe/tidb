@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -309,7 +310,10 @@ func activeTask(ctx context.Context, taskMgr *storage.TaskManager, keyPrefix str
 func submitTask(ctx context.Context, taskKey, keyspace string, meta []byte) (*proto.TaskBase, error) {
 	// The task asks for one slot whatever the build concurrency of its statement
 	// is: the scan and the sampling of ANALYZE, most of its work, run in TiKV.
-	task, err := handle.SubmitTask(ctx, taskKey, proto.AutoAnalyze, keyspace, 1, targetScope(), 1, meta)
+	// DO NOT MERGE: /tmp/daa-preemptible on the submitting node lets other tasks preempt the task, as before.
+	_, statErr := os.Stat("/tmp/daa-preemptible")
+	extraParams := proto.ExtraParams{NonPreemptible: statErr != nil}
+	task, err := handle.SubmitTaskWithExtraParams(ctx, taskKey, proto.AutoAnalyze, keyspace, 1, targetScope(), 1, extraParams, meta)
 	if err != nil {
 		// The task may have been created, do not leave it running unobserved.
 		if cancelErr := handle.CancelTask(ctx, taskKey); cancelErr != nil {
