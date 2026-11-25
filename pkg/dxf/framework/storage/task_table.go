@@ -303,6 +303,10 @@ func (mgr *TaskManager) CreateTaskWithSession(
 	if p, ok := proto.DAAIntFile(proto.DAAAnalyzePriorityFile); ok && tp == proto.AutoAnalyze && p >= 1 && p <= 1024 {
 		priority = p
 	}
+	// DO NOT MERGE: test switch for the required slots of add-index tasks.
+	if s, ok := proto.DAAIntFile(proto.DAABackfillSlotsFile); ok && tp == proto.Backfill && s >= 1 && s <= 64 {
+		requiredSlots = s
+	}
 	extraParamBytes, err := json.Marshal(extraParams)
 	if err != nil {
 		return 0, errors.Trace(err)

@@ -32,6 +32,8 @@ const (
 	// DAADrainTimeoutFile holds the seconds that a task of a higher priority waits for running AutoAnalyze
 	// tasks to finish before it preempts them. While it waits, the node starts no task of a lower rank.
 	DAADrainTimeoutFile = "/tmp/daa-drain-timeout"
+	// DAABackfillSlotsFile holds the required slots of new add-index tasks, read on the node that submits them.
+	DAABackfillSlotsFile = "/tmp/daa-backfill-slots"
 )
 
 // DAAIntFile reads the integer in the switch file, and reports whether the file exists and holds one.
