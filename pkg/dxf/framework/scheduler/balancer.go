@@ -16,6 +16,8 @@ package scheduler
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"sort"
 	"time"
 
@@ -47,6 +49,9 @@ type balancer struct {
 	// a helper temporary map to record the used slots of each node during balance
 	// to avoid passing it around.
 	currUsedSlots map[string]int
+	// nonPreemptibleSubtasks holds the active subtasks of non-preemptible tasks,
+	// read at the start of a balance round, see reserveNonPreemptibleSlots.
+	nonPreemptibleSubtasks map[int64][]*proto.SubtaskBase
 }
 
 func newBalancer(param Param) *balancer {
@@ -83,6 +88,10 @@ func (b *balancer) balance(ctx context.Context, sm *Manager) {
 	}
 
 	schedulers := sm.getSchedulers()
+	if err := b.reserveNonPreemptibleSlots(ctx, schedulers); err != nil {
+		b.logger.Warn("failed to get subtasks of non-preemptible tasks", llog.ShortError(err))
+		return
+	}
 	for _, sch := range schedulers {
 		task := sch.GetTask()
 		nodeIDs := filterByScope(managedNodes, task.TargetScope)
@@ -92,6 +101,38 @@ func (b *balancer) balance(ctx context.Context, sm *Manager) {
 			return
 		}
 	}
+}
+
+// reserveNonPreemptibleSlots adds the slots of running subtasks of non-preemptible
+// tasks before the balance in task order, as a task of higher rank cannot take them.
+func (b *balancer) reserveNonPreemptibleSlots(ctx context.Context, schedulers []Scheduler) error {
+	b.nonPreemptibleSubtasks = make(map[int64][]*proto.SubtaskBase)
+	for _, sch := range schedulers {
+		task := sch.GetTask()
+		if !task.ExtraParams.NonPreemptible {
+			continue
+		}
+		subtasks, err := b.taskMgr.GetActiveSubtasks(ctx, task.ID)
+		if err != nil {
+			return err
+		}
+		b.nonPreemptibleSubtasks[task.ID] = subtasks
+		for _, node := range b.reservedNodes(subtasks) {
+			b.currUsedSlots[node] += task.RequiredSlots
+		}
+	}
+	return nil
+}
+
+// reservedNodes returns the managed nodes that run the subtasks.
+func (b *balancer) reservedNodes(subtasks []*proto.SubtaskBase) []string {
+	nodes := make([]string, 0, 1)
+	for _, st := range subtasks {
+		if _, ok := b.currUsedSlots[st.ExecID]; ok && st.State == proto.SubtaskStateRunning && !slices.Contains(nodes, st.ExecID) {
+			nodes = append(nodes, st.ExecID)
+		}
+	}
+	return nodes
 }
 
 func (b *balancer) balanceSubtasks(ctx context.Context, sch Scheduler, managedNodes []string) error {
@@ -122,17 +163,30 @@ func filterNodesByMaxNodeCnt(nodes []string, subtasks []*proto.SubtaskBase, maxN
 }
 
 func (b *balancer) doBalanceSubtasks(ctx context.Context, task *proto.Task, eligibleNodes []string) (err error) {
-	subtasks, err := b.taskMgr.GetActiveSubtasks(ctx, task.ID)
-	if err != nil {
-		return err
+	subtasks, reserved := b.nonPreemptibleSubtasks[task.ID]
+	if !reserved {
+		subtasks, err = b.taskMgr.GetActiveSubtasks(ctx, task.ID)
+		if err != nil {
+			return err
+		}
 	}
 	if len(subtasks) == 0 {
 		return nil
 	}
 
+	usedSlots := b.currUsedSlots
+	var reservedNodes []string
+	if reserved {
+		// the task does not compete with the slots reserved for itself.
+		reservedNodes = b.reservedNodes(subtasks)
+		usedSlots = maps.Clone(usedSlots)
+		for _, node := range reservedNodes {
+			usedSlots[node] -= task.RequiredSlots
+		}
+	}
 	// balance subtasks only to nodes with enough slots, from the view of all
 	// managed nodes, subtasks of task might not be balanced.
-	adjustedNodes := filterNodesWithEnoughSlots(b.currUsedSlots, b.slotMgr.getCapacity(),
+	adjustedNodes := filterNodesWithEnoughSlots(usedSlots, b.slotMgr.getCapacity(),
 		eligibleNodes, task.RequiredSlots)
 	failpoint.Inject("mockNoEnoughSlots", func(_ failpoint.Value) {
 		adjustedNodes = []string{}
@@ -150,6 +204,9 @@ func (b *balancer) doBalanceSubtasks(ctx context.Context, task *proto.Task, elig
 
 	defer func() {
 		if err == nil {
+			for _, node := range reservedNodes {
+				b.currUsedSlots[node] -= task.RequiredSlots
+			}
 			b.updateUsedNodes(&task.TaskBase, subtasks)
 		}
 	}()
@@ -178,6 +235,14 @@ func (b *balancer) doBalanceSubtasks(ctx context.Context, task *proto.Task, elig
 	executorWithOneMoreSubtask := make(map[string]struct{}, remainder)
 	for node, sts := range executorSubtasks {
 		if _, ok := adjustedNodeMap[node]; !ok {
+			// running subtasks are in the front of sts.
+			runningCnt := len(sts) - executorPendingCnts[node]
+			if task.ExtraParams.NonPreemptible && runningCnt > 0 && slices.Contains(eligibleNodes, node) {
+				// the node is alive, so its running subtasks can finish there.
+				subtasksNeedSchedule = append(subtasksNeedSchedule, sts[runningCnt:]...)
+				executorSubtasks[node] = sts[:runningCnt]
+				continue
+			}
 			b.logger.Info("dead node or not have enough slots, schedule subtasks away",
 				zap.Int64("task-id", task.ID),
 				zap.String("task-key", task.Key),

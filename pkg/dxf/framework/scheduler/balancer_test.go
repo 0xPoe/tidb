@@ -31,6 +31,7 @@ type balanceTestCase struct {
 	subtasks          []*proto.SubtaskBase
 	eligibleNodes     []string
 	maxNodeCount      int
+	nonPreemptible    bool
 	initUsedSlots     map[string]int
 	expectedSubtasks  []*proto.SubtaskBase
 	expectedUsedSlots map[string]int
@@ -112,6 +113,25 @@ func TestBalanceOneTask(t *testing.T) {
 				{ID: 2, ExecID: "tidb2", State: proto.SubtaskStatePending},
 			},
 			expectedUsedSlots: map[string]int{"tidb1": 8, "tidb2": 16},
+		},
+		// for a non-preemptible task, the running subtask stays on tidb1 that has no
+		// enough slots, and the pending one moves. tidb3 is dead, so its running
+		// subtask moves too.
+		{
+			subtasks: []*proto.SubtaskBase{
+				{ID: 1, ExecID: "tidb1", State: proto.SubtaskStateRunning},
+				{ID: 2, ExecID: "tidb1", State: proto.SubtaskStatePending},
+				{ID: 3, ExecID: "tidb3", State: proto.SubtaskStateRunning},
+			},
+			eligibleNodes:  []string{"tidb1", "tidb2"},
+			nonPreemptible: true,
+			initUsedSlots:  map[string]int{"tidb1": 8, "tidb2": 0},
+			expectedSubtasks: []*proto.SubtaskBase{
+				{ID: 1, ExecID: "tidb1", State: proto.SubtaskStateRunning},
+				{ID: 2, ExecID: "tidb2", State: proto.SubtaskStatePending},
+				{ID: 3, ExecID: "tidb2", State: proto.SubtaskStateRunning},
+			},
+			expectedUsedSlots: map[string]int{"tidb1": 24, "tidb2": 16},
 		},
 		// running subtasks are not re-scheduled if the node is eligible, we leave it un-balanced.
 		// task executor should mark those subtasks as pending, then we can balance them.
@@ -274,7 +294,8 @@ func TestBalanceOneTask(t *testing.T) {
 				mockTaskMgr.EXPECT().UpdateSubtasksExecIDs(gomock.Any(), gomock.Any()).Return(nil)
 			}
 			mockScheduler := mock.NewMockScheduler(ctrl)
-			mockScheduler.EXPECT().GetTask().Return(&proto.Task{TaskBase: proto.TaskBase{ID: 1, RequiredSlots: 16, MaxNodeCount: c.maxNodeCount}}).Times(2)
+			mockScheduler.EXPECT().GetTask().Return(&proto.Task{TaskBase: proto.TaskBase{ID: 1, RequiredSlots: 16, MaxNodeCount: c.maxNodeCount,
+				ExtraParams: proto.ExtraParams{NonPreemptible: c.nonPreemptible}}}).Times(2)
 			mockScheduler.EXPECT().GetEligibleInstances(gomock.Any(), gomock.Any()).Return(nil, nil)
 
 			slotMgr := newSlotManager()
@@ -458,6 +479,43 @@ func TestBalanceMultipleTasks(t *testing.T) {
 	for _, c := range taskCases {
 		require.Equal(t, c.expectedSubtasks, c.subtasks)
 	}
+
+	// task 10 runs before the non-preemptible task 11, but it cannot take the slots
+	// of task 11 on tidb1, so its subtask there moves to tidb2.
+	manager = NewManager(ctx, nil, mockTaskMgr, "1", proto.NodeResourceForTest)
+	manager.slotMgr.updateCapacity(16)
+	manager.nodeMgr.nodes.Store(&[]proto.ManagedNode{{ID: "tidb1", Role: ""}, {ID: "tidb2", Role: ""}})
+	b = newBalancer(Param{
+		taskMgr: manager.taskMgr,
+		nodeMgr: manager.nodeMgr,
+		slotMgr: manager.slotMgr,
+	})
+	sch10, sch11 := mock.NewMockScheduler(ctrl), mock.NewMockScheduler(ctrl)
+	sch10.EXPECT().GetTask().Return(&proto.Task{TaskBase: proto.TaskBase{ID: 10, RequiredSlots: 8}}).AnyTimes()
+	sch11.EXPECT().GetTask().Return(&proto.Task{TaskBase: proto.TaskBase{ID: 11, RequiredSlots: 16,
+		ExtraParams: proto.ExtraParams{NonPreemptible: true}}}).AnyTimes()
+	manager.addScheduler(10, sch10)
+	manager.addScheduler(11, sch11)
+	subtasks10 := []*proto.SubtaskBase{
+		{ID: 1, ExecID: "tidb1", State: proto.SubtaskStatePending},
+		{ID: 2, ExecID: "tidb2", State: proto.SubtaskStatePending},
+	}
+	subtasks11 := []*proto.SubtaskBase{{ID: 3, ExecID: "tidb1", State: proto.SubtaskStateRunning}}
+	gomock.InOrder(
+		mockTaskMgr.EXPECT().GetActiveSubtasks(gomock.Any(), int64(11)).Return(subtasks11, nil),
+		sch10.EXPECT().GetEligibleInstances(gomock.Any(), gomock.Any()).Return(nil, nil),
+		mockTaskMgr.EXPECT().GetActiveSubtasks(gomock.Any(), int64(10)).Return(subtasks10, nil),
+		mockTaskMgr.EXPECT().UpdateSubtasksExecIDs(gomock.Any(), gomock.Any()).Return(nil),
+		sch11.EXPECT().GetEligibleInstances(gomock.Any(), gomock.Any()).Return(nil, nil),
+	)
+	b.balance(ctx, manager)
+	require.True(t, ctrl.Satisfied())
+	require.Equal(t, []*proto.SubtaskBase{
+		{ID: 1, ExecID: "tidb2", State: proto.SubtaskStatePending},
+		{ID: 2, ExecID: "tidb2", State: proto.SubtaskStatePending},
+	}, subtasks10)
+	require.Equal(t, "tidb1", subtasks11[0].ExecID)
+	require.Equal(t, map[string]int{"tidb1": 16, "tidb2": 8}, b.currUsedSlots)
 }
 
 func TestBalancerUpdateUsedNodes(t *testing.T) {
